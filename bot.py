@@ -2,18 +2,25 @@ import os
 import re
 import json
 import time
+import signal
+import sys
 from datetime import datetime
-import threading
 import requests
 import telebot
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 CHANNEL = os.environ.get('CHANNEL')  # The channel we're monitoring
+# Parse comma-separated list of authorized users
+AUTHORIZED_USERS = [username.strip() for username in os.environ.get('AUTHORIZED_USERS', '').split(',') if username.strip()]
 MESSAGE_STORAGE_FILE = 'channel_messages.json'  # File to store messages
-UPDATE_INTERVAL = 60  # Check for new messages every 60 seconds
+UPDATE_INTERVAL = 10  # Check every 10 seconds instead of 60
 MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024 * 1024  # 5GB in bytes
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+@bot.message_handler(commands=['start', 'hello'])
+def send_welcome(message):
+    bot.reply_to(message, "Howdy, how are you doing?")
 
 # Initialize storage file if it doesn't exist
 def initialize_storage():
@@ -25,17 +32,54 @@ def initialize_storage():
 # Save a new message to the storage file
 def save_message(message):
     try:
+        # Extract only the fields we need
+        message_data = {
+            'message_id': getattr(message, 'message_id', None),
+            'text': getattr(message, 'text', ''),
+            'date': getattr(message, 'date', int(time.time())),
+            'caption': getattr(message, 'caption', None),  # For media messages with captions
+        }
+        
+        # Add sender info if available (for channel posts, this might be None)
+        if hasattr(message, 'from_user') and message.from_user:
+            message_data['from'] = {
+                'id': message.from_user.id,
+                'username': message.from_user.username,
+                'first_name': message.from_user.first_name,
+                'last_name': message.from_user.last_name
+            }
+        
+        # Add chat info
+        if hasattr(message, 'chat'):
+            message_data['chat'] = {
+                'id': message.chat.id,
+                'type': message.chat.type,
+                'title': getattr(message.chat, 'title', None),
+                'username': getattr(message.chat, 'username', None)
+            }
+        
+        # Add entities if available (for links, mentions, etc.)
+        if hasattr(message, 'entities') and message.entities:
+            message_data['entities'] = []
+            for entity in message.entities:
+                message_data['entities'].append({
+                    'type': entity.type,
+                    'offset': entity.offset,
+                    'length': entity.length,
+                    'url': getattr(entity, 'url', None)
+                })
+        
         # Read existing messages
         with open(MESSAGE_STORAGE_FILE, 'r') as f:
             messages = json.load(f)
         
         # Check if this message is already stored (by message_id)
-        if any(msg.get('message_id') == message.get('message_id') for msg in messages):
+        if any(msg.get('message_id') == message_data.get('message_id') for msg in messages):
             return  # Message already exists, no need to save
         
         # Add timestamp for when we stored it
-        message['_stored_at'] = datetime.now().isoformat()
-        messages.append(message)
+        message_data['_stored_at'] = datetime.now().isoformat()
+        messages.append(message_data)
         
         # Check if the file would exceed the size limit
         temp_file = f"{MESSAGE_STORAGE_FILE}.temp"
@@ -80,7 +124,7 @@ def save_message(message):
         if os.path.exists(temp_file):
             os.remove(temp_file)
             
-        print(f"Saved new message with ID: {message.get('message_id')}, "
+        print(f"Saved new message with ID: {message_data.get('message_id')}, "
               f"Storage now contains {len(messages)} messages")
     
     except Exception as e:
@@ -89,62 +133,6 @@ def save_message(message):
         if 'temp_file' in locals() and os.path.exists(temp_file):
             os.remove(temp_file)
 
-# Fetch and store new messages from the channel
-def fetch_new_messages():
-    # Format channel username
-    channel_id = f"@{CHANNEL_USERNAME}" if not CHANNEL_USERNAME.startswith('@') else CHANNEL_USERNAME
-    
-    try:
-        # Get last update_id from our storage to avoid duplicates
-        last_update_id = 0
-        try:
-            with open(MESSAGE_STORAGE_FILE, 'r') as f:
-                messages = json.load(f)
-                # Find the max update_id if we have it stored
-                for msg in messages:
-                    if '_update_id' in msg and msg['_update_id'] > last_update_id:
-                        last_update_id = msg['_update_id']
-        except (json.JSONDecodeError, FileNotFoundError):
-            pass  # Use default last_update_id = 0
-            
-        # Fetch updates from Telegram
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        params = {"offset": last_update_id + 1 if last_update_id else None}
-        
-        response = requests.get(url, params=params)
-        data = response.json()
-        
-        if not data.get("ok"):
-            print(f"Error from Telegram API: {data.get('description')}")
-            return
-        
-        # Process and store new messages
-        for update in data.get("result", []):
-            # Look for channel posts from our target channel
-            if "channel_post" in update:
-                post = update["channel_post"]
-                chat = post.get("chat", {})
-                
-                # Check if this post is from our target channel
-                if chat.get("username", "").lower() == CHANNEL_USERNAME.lower().lstrip('@'):
-                    # Store update_id to avoid duplicates in future
-                    post['_update_id'] = update.get('update_id')
-                    save_message(post)
-            
-            # Also check for forwarded messages in regular chats
-            elif "message" in update:
-                msg = update["message"]
-                # Check if it's a message forwarded from our channel
-                forward_from_chat = msg.get("forward_from_chat", {})
-                if forward_from_chat.get("username", "").lower() == CHANNEL_USERNAME.lower().lstrip('@'):
-                    # Store this forwarded message
-                    msg['_update_id'] = update.get('update_id')
-                    msg['_forwarded'] = True
-                    save_message(msg)
-        
-        print(f"Message fetch completed at {datetime.now().isoformat()}")
-    except Exception as e:
-        print(f"Error fetching new messages: {e}")
 
 # Search for messages in the stored file
 def search_stored_messages(query):
@@ -172,20 +160,6 @@ def search_stored_messages(query):
     except Exception as e:
         print(f"Error searching stored messages: {e}")
         return None
-
-# Background task to fetch messages periodically
-def message_fetcher():
-    while True:
-        try:
-            fetch_new_messages()
-            time.sleep(UPDATE_INTERVAL)
-        except Exception as e:
-            print(f"Error in message fetcher thread: {e}")
-            time.sleep(10)  # Shorter wait if there was an error
-
-@bot.message_handler(commands=['start', 'hello'])
-def send_welcome(message):
-    bot.reply_to(message, "Howdy, how are you doing?")
 
 @bot.message_handler(commands=['status'])
 def status_check(message):
@@ -220,52 +194,65 @@ def status_check(message):
 
 @bot.message_handler(func=lambda message: True)
 def echo_all(message):
+    print(AUTHORIZED_USERS, message.from_user.username)
+    # Check if the message is from an authorized user first
+    if message.from_user.username not in AUTHORIZED_USERS:
+        bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
+        return
+    
     # Extract the word that comes before '/status/'
     pattern = r'/(\w+)/status/'
     match = re.search(pattern, message.text)
     
     if match:
         extracted_text = match.group(1)
-        
         bot.reply_to(message, f"Searching for '{extracted_text}' in stored channel messages...")
-        
-        try:
-            # Search for this text in our stored channel messages
-            found_message = search_stored_messages(extracted_text)
-            
-            if found_message:
-                # Format the response
-                sender = "Channel Post"  # Channel posts don't have a "from" field like user messages
-                if "_forwarded" in found_message:
-                    sender = f"Forwarded by {found_message.get('from', {}).get('first_name', 'Unknown')}"
-                
-                msg_date = datetime.fromtimestamp(found_message.get("date", 0))
-                msg_text = found_message.get("text", "No text")
-                
-                response = (
-                    f"Found message with '{extracted_text}':\n"
-                    f"Source: {sender}\n"
-                    f"Date: {msg_date.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"Message: {msg_text}"
-                )
-                bot.reply_to(message, response)
-            else:
-                bot.reply_to(message, f"No messages found containing '{extracted_text}'")
-        except Exception as e:
-            bot.reply_to(message, f"Error searching messages: {str(e)}")
-            print(f"Exception details: {e}")
     else:
         # No match, echo as before
-        bot.reply_to(message, message.text)
+        bot.reply_to(message, 'Not a twitter post link')
+
+# Add a handler for channel posts
+@bot.channel_post_handler(func=lambda message: True)
+def handle_channel_post(message):
+    """Handle posts from channels"""
+    # Check if this is from our target channel
+    chat = message.chat
+    chat_id = chat.id
+    chat_username = getattr(chat, 'username', '')
+    chat_title = getattr(chat, 'title', '')
+    
+    # Try to match based on ID, username, or title
+    channel_identifier = CHANNEL.lstrip('@') if CHANNEL.startswith('@') else CHANNEL
+    
+    if (str(chat_id) == channel_identifier or 
+        (chat_username and chat_username.lower() == channel_identifier.lower()) or
+        (chat_title and chat_title.lower() == channel_identifier.lower())):
+        
+        # Save this channel message - pass the message object directly
+        save_message(message)
+        print(f"✅ Saved message {message.message_id} from channel {chat_title}")
+
+# Simplified signal handler - no thread management needed
+def signal_handler(sig, frame):
+    print('You pressed Ctrl+C! Shutting down gracefully...')
+    print("Exiting...")
+    sys.exit(0)
 
 if __name__ == "__main__":
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+    
     # Initialize the storage
     initialize_storage()
     
-    # Start the background thread to fetch messages
-    fetcher_thread = threading.Thread(target=message_fetcher, daemon=True)
-    fetcher_thread.start()
-    
-    # Start the bot
-    print("Bot started. Press Ctrl+C to exit.")
-    bot.infinity_polling()
+    try:
+        # Start the bot with allowed_updates to include channel_post
+        print("Bot started. Press Ctrl+C to exit.")
+        bot.infinity_polling(timeout=60, long_polling_timeout=30, allowed_updates=['message', 'channel_post'])
+    except KeyboardInterrupt:
+        # This may still happen if Ctrl+C is pressed during bot initialization
+        signal_handler(signal.SIGINT, None)
+    except Exception as e:
+        print(f"Bot error: {e}")
+        signal_handler(signal.SIGTERM, None)

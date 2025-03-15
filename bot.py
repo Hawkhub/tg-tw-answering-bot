@@ -7,6 +7,7 @@ import sys
 from datetime import datetime
 import requests
 import telebot
+from bs4 import BeautifulSoup
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 CHANNEL = os.environ.get('CHANNEL')  # The channel we're monitoring
@@ -194,7 +195,6 @@ def status_check(message):
 
 @bot.message_handler(func=lambda message: True)
 def echo_all(message):
-    print(AUTHORIZED_USERS, message.from_user.username)
     # Check if the message is from an authorized user first
     if message.from_user.username not in AUTHORIZED_USERS:
         bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
@@ -207,6 +207,35 @@ def echo_all(message):
     if match:
         extracted_text = match.group(1)
         bot.reply_to(message, f"Searching for '{extracted_text}' in stored channel messages...")
+        
+        # Search in our JSON storage first
+        json_result = search_stored_messages(extracted_text)
+        
+        # Search in exported HTML files
+        html_results = search_exported_html(extracted_text)
+        
+        if json_result or html_results:
+            # Format the response with search results
+            response = f"Found mentions of '{extracted_text}':\n\n"
+            
+            # Add JSON result if found
+            if json_result:
+                response += f"📩 Recent message:\n"
+                if 'text' in json_result:
+                    response += f"{json_result['text'][:200]}...\n\n"
+            
+            # Add HTML results (up to 3)
+            if html_results:
+                response += f"📚 History mentions ({len(html_results)}):\n"
+                for idx, result in enumerate(html_results[:3]):
+                    response += f"{idx+1}. {result['text'][:100]}...\n"
+                
+                if len(html_results) > 3:
+                    response += f"...and {len(html_results) - 3} more results\n"
+            
+            bot.reply_to(message, response)
+        else:
+            bot.reply_to(message, f"No mentions of '{extracted_text}' found in channel history.")
     else:
         # No match, echo as before
         bot.reply_to(message, 'Not a twitter post link')
@@ -237,6 +266,95 @@ def signal_handler(sig, frame):
     print('You pressed Ctrl+C! Shutting down gracefully...')
     print("Exiting...")
     sys.exit(0)
+
+def search_exported_html(query):
+    """
+    Search for the query in all exported HTML files in .channel_data folder.
+    Returns a list of matching message IDs and their contexts.
+    """
+    results = []
+    channel_data_dir = '.channel_data'
+    
+    if not os.path.exists(channel_data_dir):
+        print(f"Warning: {channel_data_dir} directory not found")
+        return results
+    
+    print(f"Searching for '{query}' in exported HTML files...")
+    
+    # Walk through all directories in .channel_data
+    for root, dirs, files in os.walk(channel_data_dir):
+        # Filter for HTML message files
+        html_files = [f for f in files if re.match(r'messages\d*\.html', f)]
+        
+        for html_file in html_files:
+            file_path = os.path.join(root, html_file)
+            print(f"Checking file: {file_path}")
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    html_content = f.read()
+                
+                # Parse HTML with BeautifulSoup
+                soup = BeautifulSoup(html_content, 'html.parser')
+                
+                # Find all message divs
+                message_divs = soup.find_all('div', id=re.compile(r'message\d+'))
+                
+                for div in message_divs:
+                    # Extract message ID
+                    message_id_match = re.match(r'message(\d+)', div.get('id', ''))
+                    if not message_id_match:
+                        continue
+                    
+                    message_id = message_id_match.group(1)
+                    
+                    # Find text div within this message
+                    text_div = div.find('div', class_='text')
+                    if not text_div:
+                        continue
+                    
+                    # Get text content
+                    text_content = text_div.get_text(strip=True)
+                    
+                    # Check if query is in text content
+                    if query.lower() in text_content.lower():
+                        # Get date information if available
+                        date_div = div.find('div', class_='pull_right date details')
+                        date_text = date_div.get('title', '') if date_div else ''
+                        
+                        # Get sender information if available
+                        from_div = div.find('div', class_='from_name')
+                        from_name = from_div.get_text(strip=True) if from_div else ''
+                        
+                        # Extract Twitter links if present
+                        twitter_links = []
+                        links = text_div.find_all('a')
+                        for link in links:
+                            href = link.get('href', '')
+                            if 'twitter.com' in href or 'x.com' in href:
+                                twitter_links.append(href)
+                        
+                        # Gather result information
+                        result = {
+                            'message_id': message_id,
+                            'text': text_content,
+                            'date': date_text,
+                            'from': from_name,
+                            'file_path': file_path,
+                            'twitter_links': twitter_links
+                        }
+                        
+                        results.append(result)
+                        print(f"Found match in message {message_id}: {text_content[:50]}...")
+            
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+    
+    # Sort results by message_id (as a numeric value)
+    results.sort(key=lambda x: int(x['message_id']))
+    
+    print(f"Found {len(results)} matching messages for query '{query}'")
+    return results
 
 if __name__ == "__main__":
     # Set up signal handlers

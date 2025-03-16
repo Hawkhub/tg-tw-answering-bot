@@ -200,12 +200,17 @@ def echo_all(message):
         bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
         return
     
-    # Extract the word that comes before '/status/'
-    pattern = r'/(\w+)/status/'
+    # Extract both the Twitter username and tweet ID
+    pattern = r'/(\w+)/status/(\d+)'
     match = re.search(pattern, message.text)
     
     if match:
         twitter_username = match.group(1)
+        tweet_id = match.group(2)
+        
+        # Create the clean x.com URL format
+        reconstructed_link = f"https://x.com/{twitter_username}/status/{tweet_id}"
+        
         bot.reply_to(message, f"Searching for '{twitter_username}' in channel history...")
         
         # First search in our JSON storage (recent messages)
@@ -265,13 +270,13 @@ def echo_all(message):
             # Send response to the user
             bot.reply_to(message, response)
             
-            # Now post the Twitter link to the channel as a reply to the found message
+            # Now post the reconstructed Twitter link to the channel as a reply
             if channel_id and reply_message_id:
                 try:
-                    # Post the Twitter link to the channel as a reply
+                    # Post the reconstructed X link to the channel as a reply
                     sent_message = bot.send_message(
                         chat_id=channel_id,
-                        text=f"New update from {twitter_username}:\n{message.text}",
+                        text=reconstructed_link,
                         reply_to_message_id=reply_message_id
                     )
                     
@@ -279,7 +284,7 @@ def echo_all(message):
                     save_message(sent_message)
                     print(f"✅ Sent and saved message {sent_message.message_id} to channel")
                     
-                    bot.reply_to(message, f"✅ Posted your Twitter link to the channel as a reply to message {reply_message_id}")
+                    bot.reply_to(message, f"✅ Posted the link to the channel as a reply to message {reply_message_id}")
                 except Exception as e:
                     print(f"Error posting to channel: {e}")
                     bot.reply_to(message, f"❌ Error posting to channel: {str(e)}")

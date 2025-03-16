@@ -205,40 +205,91 @@ def echo_all(message):
     match = re.search(pattern, message.text)
     
     if match:
-        extracted_text = match.group(1)
-        bot.reply_to(message, f"Searching for '{extracted_text}' in stored channel messages...")
+        twitter_username = match.group(1)
+        bot.reply_to(message, f"Searching for '{twitter_username}' in channel history...")
         
-        # Search in our JSON storage first
-        json_result = search_stored_messages(extracted_text)
+        # First search in our JSON storage (recent messages)
+        json_result = search_stored_messages(twitter_username)
         
-        # Search in exported HTML files
-        html_results = search_exported_html(extracted_text)
+        # Only search in HTML files if nothing found in JSON
+        html_results = []
+        channel_id = None
+        if not json_result:
+            bot.reply_to(message, "Not found in recent messages. Searching in older exported history...")
+            html_results = search_exported_html(twitter_username)
+            
+            # For HTML results, we need to determine the channel ID
+            if html_results:
+                # Use the configured channel ID since we're searching that channel's history
+                channel_id = CHANNEL
+                # If channel starts with @, we need to get its ID
+                if channel_id.startswith('@'):
+                    try:
+                        channel_info = bot.get_chat(channel_id)
+                        channel_id = channel_info.id
+                    except Exception as e:
+                        print(f"Error getting channel ID: {e}")
+                        bot.reply_to(message, "Found results but couldn't determine channel ID to reply.")
+                        return
         
         if json_result or html_results:
             # Format the response with search results
-            response = f"Found mentions of '{extracted_text}':\n\n"
+            response = f"✅ Found mentions of '{twitter_username}':\n\n"
             
-            # Add JSON result if found
+            # Variable to store the message ID we'll reply to
+            reply_message_id = None
+            
+            # Add JSON result if found (prioritize this as it's most recent)
             if json_result:
                 response += f"📩 Recent message:\n"
                 if 'text' in json_result:
                     response += f"{json_result['text'][:200]}...\n\n"
+                
+                # Get message ID and chat ID for replying
+                reply_message_id = json_result.get('message_id')
+                if 'chat' in json_result:
+                    channel_id = json_result['chat'].get('id')
             
-            # Add HTML results (up to 3)
-            if html_results:
-                response += f"📚 History mentions ({len(html_results)}):\n"
+            # Add HTML results (up to 3) only if we didn't find a JSON result
+            elif html_results:
+                response += f"📚 From history ({len(html_results)} found):\n"
                 for idx, result in enumerate(html_results[:3]):
                     response += f"{idx+1}. {result['text'][:100]}...\n"
                 
                 if len(html_results) > 3:
                     response += f"...and {len(html_results) - 3} more results\n"
+                
+                # Use the first result for replying
+                reply_message_id = int(html_results[0]['message_id'])
             
+            # Send response to the user
             bot.reply_to(message, response)
+            
+            # Now post the Twitter link to the channel as a reply to the found message
+            if channel_id and reply_message_id:
+                try:
+                    # Post the Twitter link to the channel as a reply
+                    sent_message = bot.send_message(
+                        chat_id=channel_id,
+                        text=f"New update from {twitter_username}:\n{message.text}",
+                        reply_to_message_id=reply_message_id
+                    )
+                    
+                    # Manually save the message the bot just sent
+                    save_message(sent_message)
+                    print(f"✅ Sent and saved message {sent_message.message_id} to channel")
+                    
+                    bot.reply_to(message, f"✅ Posted your Twitter link to the channel as a reply to message {reply_message_id}")
+                except Exception as e:
+                    print(f"Error posting to channel: {e}")
+                    bot.reply_to(message, f"❌ Error posting to channel: {str(e)}")
+            else:
+                bot.reply_to(message, "⚠️ Couldn't post to channel: missing channel ID or message ID.")
         else:
-            bot.reply_to(message, f"No mentions of '{extracted_text}' found in channel history.")
+            bot.reply_to(message, f"❌ No mentions of '{twitter_username}' found in any channel history.")
     else:
         # No match, echo as before
-        bot.reply_to(message, 'Not a twitter post link')
+        bot.reply_to(message, 'Not a Twitter post link.')
 
 # Add a handler for channel posts
 @bot.channel_post_handler(func=lambda message: True)

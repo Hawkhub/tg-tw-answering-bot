@@ -1,15 +1,8 @@
-import os
-import re
-import json
-import time
 import signal
 import sys
-from datetime import datetime
-import requests
 import telebot
-from bs4 import BeautifulSoup
 from config import BOT_TOKEN
-from storage import initialize_storage, save_message
+from storage import initialize_storage
 from handlers.user_handlers import handle_welcome, handle_status_check, handle_twitter_link
 from handlers.channel_handlers import handle_channel_post
 

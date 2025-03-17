@@ -1,8 +1,11 @@
 import re
+import os
 from datetime import datetime
+import tempfile
 from config import AUTHORIZED_USERS, MESSAGE_STORAGE_FILE, CHANNEL
 from storage import save_message
 from search import search_stored_messages, search_exported_html
+from tweet_fetcher import get_tweet_content, download_media
 
 def handle_welcome(bot, message):
     """Handle /start and /hello commands"""
@@ -62,6 +65,7 @@ def handle_twitter_link(bot, message):
     # Create the clean x.com URL format
     reconstructed_link = f"https://x.com/{twitter_username}/status/{tweet_id}"
     
+    # Search for mentions of the Twitter username
     bot.reply_to(message, f"Searching for '{twitter_username}' in channel history...")
     
     # First search in our JSON storage (recent messages)
@@ -69,31 +73,17 @@ def handle_twitter_link(bot, message):
     
     # Only search in HTML files if nothing found in JSON
     html_results = []
-    channel_id = None
+    channel_id = CHANNEL  # Default to the configured channel
+    reply_message_id = None  # Will remain None if no results found
+    
     if not json_result:
         bot.reply_to(message, "Not found in recent messages. Searching in older exported history...")
         html_results = search_exported_html(twitter_username)
-        
-        # For HTML results, we need to determine the channel ID
-        if html_results:
-            # Use the configured channel ID since we're searching that channel's history
-            channel_id = CHANNEL
-            # If channel starts with @, we need to get its ID
-            if channel_id.startswith('@'):
-                try:
-                    channel_info = bot.get_chat(channel_id)
-                    channel_id = channel_info.id
-                except Exception as e:
-                    print(f"Error getting channel ID: {e}")
-                    bot.reply_to(message, "Found results but couldn't determine channel ID to reply.")
-                    return
     
+    # If we found results, format a response with the match details
     if json_result or html_results:
         # Format the response with search results
         response = f"✅ Found mentions of '{twitter_username}':\n\n"
-        
-        # Variable to store the message ID we'll reply to
-        reply_message_id = None
         
         # Add JSON result if found (prioritize this as it's most recent)
         if json_result:
@@ -117,29 +107,132 @@ def handle_twitter_link(bot, message):
             
             # Use the first result for replying
             reply_message_id = int(html_results[0]['message_id'])
+            
+            # If channel_id is a string (username), we need to get the numeric ID
+            if isinstance(channel_id, str) and channel_id.startswith('@'):
+                try:
+                    channel_info = bot.get_chat(channel_id)
+                    channel_id = channel_info.id
+                except Exception as e:
+                    print(f"Error getting channel ID: {e}")
+                    bot.reply_to(message, "Found results but couldn't determine channel ID.")
+                    return
         
         # Send response to the user
         bot.reply_to(message, response)
-        
-        # Now post the reconstructed Twitter link to the channel as a reply
-        if channel_id and reply_message_id:
-            try:
-                # Post the reconstructed X link to the channel as a reply
-                sent_message = bot.send_message(
-                    chat_id=channel_id,
-                    text=reconstructed_link,
-                    reply_to_message_id=reply_message_id
-                )
-                
-                # Manually save the message the bot just sent
-                save_message(sent_message)
-                print(f"✅ Sent and saved message {sent_message.message_id} to channel")
-                
-                bot.reply_to(message, f"✅ Posted the link to the channel as a reply to message {reply_message_id}")
-            except Exception as e:
-                print(f"Error posting to channel: {e}")
-                bot.reply_to(message, f"❌ Error posting to channel: {str(e)}")
-        else:
-            bot.reply_to(message, "⚠️ Couldn't post to channel: missing channel ID or message ID.")
     else:
-        bot.reply_to(message, f"❌ No mentions of '{twitter_username}' found in any channel history.") 
+        bot.reply_to(message, f"ℹ️ No previous mentions of '{twitter_username}' found. Will post as a new message.")
+        # If channel_id is a string (username), we need to get the numeric ID
+        if isinstance(channel_id, str) and channel_id.startswith('@'):
+            try:
+                channel_info = bot.get_chat(channel_id)
+                channel_id = channel_info.id
+            except Exception as e:
+                print(f"Error getting channel ID: {e}")
+                bot.reply_to(message, "Couldn't determine channel ID.")
+                return
+    
+    # Get tweet content (do this regardless of whether we found previous mentions)
+    bot.send_message(message.chat.id, "📥 Fetching tweet content...")
+    tweet_content = get_tweet_content(twitter_username, tweet_id)
+    
+    if tweet_content and (tweet_content.get('text') or tweet_content.get('media_urls')):
+        # Send tweet content to user
+        content_msg = f"📝 Tweet content:\n\n"
+        if tweet_content.get('text'):
+            content_msg += f"{tweet_content['text']}\n\n"
+        content_msg += f"Source: {tweet_content['source']}"
+        
+        user_msg = bot.send_message(message.chat.id, content_msg)
+        
+        # Send media if available
+        media_sent = False
+        if tweet_content.get('media_urls'):
+            for idx, media_url in enumerate(tweet_content['media_urls'][:4]):  # Limit to 4 media items
+                try:
+                    # Create temp file for the media
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_url)[1]) as tmp:
+                        tmp_path = tmp.name
+                    
+                    # Download the media
+                    if download_media(media_url, tmp_path):
+                        # Determine type and send
+                        if any(media_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                            with open(tmp_path, 'rb') as photo:
+                                bot.send_photo(message.chat.id, photo)
+                                media_sent = True
+                        elif any(media_url.lower().endswith(ext) for ext in ['.mp4', '.mov', '.avi']):
+                            with open(tmp_path, 'rb') as video:
+                                bot.send_video(message.chat.id, video)
+                                media_sent = True
+                        else:
+                            with open(tmp_path, 'rb') as doc:
+                                bot.send_document(message.chat.id, doc)
+                                media_sent = True
+                    
+                    # Clean up temp file
+                    os.unlink(tmp_path)
+                except Exception as e:
+                    print(f"Error sending media: {e}")
+            
+            if not media_sent:
+                bot.send_message(message.chat.id, "⚠️ Could not download or send media files.")
+    else:
+        bot.send_message(message.chat.id, "⚠️ Could not retrieve tweet content.")
+    
+    # Post to the channel (either as a reply or new message)
+    if channel_id:
+        try:
+            # Build channel message with tweet content if available
+            channel_msg = reconstructed_link
+            
+            if tweet_content and tweet_content.get('text'):
+                # Add tweet text if available (limit to ~200 chars)
+                text = tweet_content['text']
+                if len(text) > 200:
+                    text = text[:197] + "..."
+                channel_msg = f"{text}\n\n{channel_msg}"
+            
+            # Post the X link to the channel (as a reply if we have a message_id)
+            sent_message = bot.send_message(
+                chat_id=channel_id,
+                text=channel_msg,
+                reply_to_message_id=reply_message_id  # This will be None if no previous mentions found
+            )
+            
+            # If we have media and it's an image, send it as a reply to our message
+            if tweet_content and tweet_content.get('media_urls'):
+                for idx, media_url in enumerate(tweet_content['media_urls'][:1]):  # Just send first image
+                    try:
+                        # Create temp file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_url)[1]) as tmp:
+                            tmp_path = tmp.name
+                        
+                        # Download and send
+                        if download_media(media_url, tmp_path):
+                            if any(media_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                                with open(tmp_path, 'rb') as photo:
+                                    bot.send_photo(
+                                        chat_id=channel_id,
+                                        photo=photo,
+                                        reply_to_message_id=sent_message.message_id
+                                    )
+                        
+                        # Clean up
+                        os.unlink(tmp_path)
+                    except Exception as e:
+                        print(f"Error sending media to channel: {e}")
+            
+            # Manually save the message the bot just sent
+            save_message(sent_message)
+            print(f"✅ Sent and saved message {sent_message.message_id} to channel")
+            
+            if reply_message_id:
+                bot.reply_to(message, f"✅ Posted the tweet to the channel as a reply to message {reply_message_id}")
+            else:
+                bot.reply_to(message, f"✅ Posted the tweet to the channel as a new message")
+        except Exception as e:
+            print(f"Error posting to channel: {e}")
+            bot.reply_to(message, f"❌ Error posting to channel: {str(e)}")
+    else:
+        bot.reply_to(message, "⚠️ Couldn't post to channel: missing channel ID.") 

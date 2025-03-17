@@ -6,6 +6,7 @@ from config import AUTHORIZED_USERS, MESSAGE_STORAGE_FILE, CHANNEL
 from storage import save_message
 from search import search_stored_messages, search_exported_html
 from tweet_fetcher import get_tweet_content, download_media
+from handlers.channel_handlers import post_tweet_to_channel
 
 def handle_welcome(bot, message):
     """Handle /start and /hello commands"""
@@ -145,30 +146,39 @@ def handle_twitter_link(bot, message):
         
         user_msg = bot.send_message(message.chat.id, content_msg)
         
-        # Send media if available
+        # Send media if available with improved type detection
         media_sent = False
         if tweet_content.get('media_urls'):
             for idx, media_url in enumerate(tweet_content['media_urls'][:4]):  # Limit to 4 media items
                 try:
                     # Create temp file for the media in our .temp directory
-                    file_ext = os.path.splitext(media_url)[1]
+                    file_ext = os.path.splitext(media_url)[1].lower()
                     if not file_ext:
-                        file_ext = '.jpg'  # Default to jpg if no extension
+                        # Default to jpg if no extension
+                        file_ext = '.jpg'
                     
                     tmp_path = os.path.join('.temp', 'media', f"media_{tweet_id}_{idx}{file_ext}")
                     
                     # Download the media
                     if download_media(media_url, tmp_path):
-                        # Determine type and send
-                        if any(media_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                        # Enhanced media type detection
+                        if file_ext in ['.jpg', '.jpeg', '.png']:
+                            # Static images
                             with open(tmp_path, 'rb') as photo:
                                 bot.send_photo(message.chat.id, photo)
                                 media_sent = True
-                        elif any(media_url.lower().endswith(ext) for ext in ['.mp4', '.mov', '.avi']):
+                        elif file_ext == '.gif':
+                            # Animated GIFs should use send_animation
+                            with open(tmp_path, 'rb') as animation:
+                                bot.send_animation(message.chat.id, animation)
+                                media_sent = True
+                        elif file_ext in ['.mp4', '.mov', '.avi', '.webm']:
+                            # Videos
                             with open(tmp_path, 'rb') as video:
                                 bot.send_video(message.chat.id, video)
                                 media_sent = True
                         else:
+                            # Other file types or unknown
                             with open(tmp_path, 'rb') as doc:
                                 bot.send_document(message.chat.id, doc)
                                 media_sent = True
@@ -178,6 +188,8 @@ def handle_twitter_link(bot, message):
                         os.unlink(tmp_path)
                 except Exception as e:
                     print(f"Error sending media: {e}")
+                    import traceback
+                    print(traceback.format_exc())
             
             if not media_sent:
                 bot.send_message(message.chat.id, "⚠️ Could not download or send media files.")
@@ -186,61 +198,22 @@ def handle_twitter_link(bot, message):
     
     # Post to the channel (either as a reply or new message)
     if channel_id:
-        try:
-            # Build channel message with tweet content if available
-            channel_msg = reconstructed_link
-            
-            if tweet_content and tweet_content.get('text'):
-                # Add tweet text if available (limit to ~200 chars)
-                text = tweet_content['text']
-                if len(text) > 200:
-                    text = text[:197] + "..."
-                channel_msg = f"{text}\n\n{channel_msg}"
-            
-            # Post the X link to the channel (as a reply if we have a message_id)
-            sent_message = bot.send_message(
-                chat_id=channel_id,
-                text=channel_msg,
-                reply_to_message_id=reply_message_id  # This will be None if no previous mentions found
-            )
-            
-            # If we have media and it's an image, send it as a reply to our message
-            if tweet_content and tweet_content.get('media_urls'):
-                for idx, media_url in enumerate(tweet_content['media_urls'][:1]):  # Just send first image
-                    try:
-                        # Create temp file for the media in our .temp directory
-                        file_ext = os.path.splitext(media_url)[1]
-                        if not file_ext:
-                            file_ext = '.jpg'  # Default to jpg if no extension
-                        
-                        tmp_path = os.path.join('.temp', 'media', f"media_{tweet_id}_{idx}{file_ext}")
-                        
-                        # Download the media
-                        if download_media(media_url, tmp_path):
-                            if any(media_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
-                                with open(tmp_path, 'rb') as photo:
-                                    bot.send_photo(
-                                        chat_id=channel_id,
-                                        photo=photo,
-                                        reply_to_message_id=sent_message.message_id
-                                    )
-                        
-                        # Clean up temp file
-                        if os.path.exists(tmp_path):
-                            os.unlink(tmp_path)
-                    except Exception as e:
-                        print(f"Error sending media to channel: {e}")
-            
-            # Manually save the message the bot just sent
-            save_message(sent_message)
-            print(f"✅ Sent and saved message {sent_message.message_id} to channel")
-            
+        # Use the channel handler function to post the tweet
+        result = post_tweet_to_channel(
+            bot=bot, 
+            channel_id=channel_id, 
+            tweet_content=tweet_content, 
+            twitter_username=twitter_username, 
+            tweet_id=tweet_id, 
+            reply_message_id=reply_message_id
+        )
+        
+        if result['success']:
             if reply_message_id:
                 bot.reply_to(message, f"✅ Posted the tweet to the channel as a reply to message {reply_message_id}")
             else:
                 bot.reply_to(message, f"✅ Posted the tweet to the channel as a new message")
-        except Exception as e:
-            print(f"Error posting to channel: {e}")
-            bot.reply_to(message, f"❌ Error posting to channel: {str(e)}")
+        else:
+            bot.reply_to(message, f"❌ Error posting to channel: {result['error']}")
     else:
         bot.reply_to(message, "⚠️ Couldn't post to channel: missing channel ID.") 

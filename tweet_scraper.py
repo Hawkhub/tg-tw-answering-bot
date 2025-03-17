@@ -3,11 +3,10 @@ from bs4 import BeautifulSoup
 import random
 import re
 import logging
-import asyncio
-from playwright.async_api import async_playwright
-import os
 import json
 import time
+import asyncio
+from playwright.async_api import async_playwright
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -15,22 +14,6 @@ logger = logging.getLogger('tweet_fetcher')
 
 # For tweet URL pattern matching
 TWEET_URL_PATTERN = r'https?://(?:www\.)?(twitter|x)\.com/(\w+)/status/(\d+)'
-
-# Create directories for temp files (at the top of the file after imports)
-def ensure_temp_dirs():
-    """Ensure all temporary directories exist"""
-    temp_dirs = [
-        '.temp',
-        '.temp/html',
-        '.temp/screenshots',
-        '.temp/media',
-        '.temp/profiles'
-    ]
-    for directory in temp_dirs:
-        os.makedirs(directory, exist_ok=True)
-
-# Call this when the module is imported
-ensure_temp_dirs()
 
 def extract_tweet_info(url):
     """Extract username and tweet ID from Twitter/X URL"""
@@ -99,13 +82,16 @@ def get_tweet_content(username, tweet_id):
     return result
 
 def get_tweet_metadata(username, tweet_id):
+    """
+    Try to extract tweet content from metadata (Open Graph, Twitter Cards)
+    """
     # Try alternative URL format
     urls_to_try = [
         f"https://x.com/{username}/status/{tweet_id}",
         f"https://twitter.com/{username}/status/{tweet_id}"  # Some systems might still work with twitter.com
     ]
     
-    # Even more comprehensive headers
+    # Comprehensive headers to look more like a browser
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.99 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml',
@@ -122,28 +108,19 @@ def get_tweet_metadata(username, tweet_id):
             # Log more details
             logger.info(f"Response size: {len(response.text)} bytes")
             
-            # Save the HTML for debugging - updated path
-            debug_path = os.path.join('.temp', 'html', f"debug_tweet_{username}_{tweet_id}.html")
-            with open(debug_path, "w", encoding="utf-8") as f:
+            # Save the HTML for debugging
+            with open(f"debug_tweet_{username}_{tweet_id}.html", "w", encoding="utf-8") as f:
                 f.write(response.text)
-            logger.info(f"Saved HTML to {debug_path}")
+            logger.info(f"Saved HTML to debug_tweet_{username}_{tweet_id}.html")
             
-            # Dump all meta tags for debugging
+            # Parse the page
             soup = BeautifulSoup(response.text, 'html.parser')
-            meta_tags = soup.find_all('meta')
-            for tag in meta_tags:
-                if tag.get('content'):
-                    logger.debug(f"Meta tag: {tag.get('name') or tag.get('property')} = {tag.get('content')[:50]}...")
             
-            # Just get title and any image we can find
+            # Try to extract the tweet text from title or meta tags
             title = soup.find('title')
             title_text = title.get_text(strip=True) if title else None
             
-            # Log the raw title to help with debugging
-            if title_text:
-                logger.debug(f"Raw title: {title_text}")
-            
-            # Clean up the title if we got one
+            # Try to clean up the title if we got one
             if title_text:
                 # Try several patterns to extract the actual tweet text
                 patterns = [
@@ -158,10 +135,18 @@ def get_tweet_metadata(username, tweet_id):
                         title_text = match.group(1)
                         break
             
-            # Improved media extraction with better filtering
+            # Try to extract from meta description as alternative
+            if not title_text or len(title_text) < 5:  # Too short, likely not the tweet text
+                meta_desc = soup.find('meta', attrs={'name': 'description'})
+                if meta_desc and 'content' in meta_desc.attrs:
+                    desc_text = meta_desc['content']
+                    if len(desc_text) > 10:  # Seems like a real description
+                        title_text = desc_text
+            
+            # Extract media URLs
             media_urls = []
             
-            # Look for Twitter card image which is usually the tweet media
+            # Twitter card image
             card_img = soup.find('meta', attrs={'name': 'twitter:image'})
             if card_img and 'content' in card_img.attrs:
                 img_url = card_img['content']
@@ -169,7 +154,7 @@ def get_tweet_metadata(username, tweet_id):
                 if not any(x in img_url.lower() for x in ['profile_images', 'icon', 'logo']):
                     media_urls.append(img_url)
             
-            # Look for OG image as fallback
+            # OG image as fallback
             if not media_urls:
                 og_img = soup.find('meta', attrs={'property': 'og:image'})
                 if og_img and 'content' in og_img.attrs:
@@ -178,19 +163,7 @@ def get_tweet_metadata(username, tweet_id):
                     if not any(x in img_url.lower() for x in ['profile_images', 'icon', 'logo']):
                         media_urls.append(img_url)
             
-            # Look for any image with 'media' in URL as last resort
-            if not media_urls:
-                imgs = soup.find_all('img')
-                for img in imgs:
-                    if 'src' in img.attrs:
-                        img_url = img['src']
-                        # Prioritize URLs that look like tweet media
-                        if any(x in img_url.lower() for x in ['media', 'photo', 'video', 'tweet']):
-                            if not any(x in img_url.lower() for x in ['profile_images', 'icon', 'logo']):
-                                media_urls.append(img_url)
-                                break
-            
-            # Log what we found with better context
+            # Log what we found
             logger.info(f"Metadata approach found text: {bool(title_text)} and {len(media_urls)} media items")
             if media_urls:
                 logger.info(f"Media URLs: {media_urls}")
@@ -208,45 +181,6 @@ def get_tweet_metadata(username, tweet_id):
     logger.error("All metadata retrieval methods failed")
     return None
 
-def download_media(url, output_path):
-    """
-    Download media from URL to the specified path
-    Returns True if successful, False otherwise
-    """
-    try:
-        logger.info(f"Downloading media from {url}")
-        response = requests.get(url, stream=True, timeout=30)
-        
-        if response.status_code != 200:
-            logger.warning(f"Download received non-200 status code: {response.status_code}")
-            return False
-            
-        with open(output_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        logger.info(f"Successfully downloaded media to {output_path}")
-        return True
-    
-    except Exception as e:
-        logger.error(f"Error downloading media: {str(e)}")
-        return False
-
-# Testing function - use this to debug specific tweet fetching
-def test_tweet_fetch(username, tweet_id):
-    """
-    Test function to fetch a tweet and print the results for debugging
-    """
-    print(f"Testing tweet fetch for @{username}/status/{tweet_id}")
-    result = get_tweet_content(username, tweet_id)
-    
-    print("\nRESULT:")
-    print(f"Text: {result.get('text')}")
-    print(f"Media URLs: {result.get('media_urls')}")
-    print(f"Source: {result.get('source')}")
-    
-    return result
-
 async def get_tweet_content_with_playwright_async(username, tweet_id):
     """
     Async Playwright implementation with stealth techniques.
@@ -259,8 +193,8 @@ async def get_tweet_content_with_playwright_async(username, tweet_id):
             # Use persistent context approach instead of args
             browser_type = p.chromium
             
-            # Define the user data directory - updated to use .temp folder
-            user_data_dir = os.path.join(os.getcwd(), ".temp", "profiles", f"profile_{random.randint(1, 5)}")
+            # Define the user data directory
+            user_data_dir = "/tmp/playwright_profile"
             
             # More robust error handling when launching browser
             try:
@@ -365,6 +299,15 @@ async def get_tweet_content_with_playwright_async(username, tweet_id):
             logger.info(f"Adding human-like delay of {human_delay:.2f} seconds")
             await asyncio.sleep(human_delay)
             
+            # Random scrolling
+            if random.random() > 0.5:
+                try:
+                    logger.info("Performing random scrolling")
+                    await page.mouse.wheel(0, random.randint(100, 300))
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                except Exception as e:
+                    logger.warning(f"Scrolling failed: {e}, continuing anyway")
+            
             # Go to tweet URL with better error handling
             try:
                 logger.info(f"Navigating to tweet URL")
@@ -387,11 +330,13 @@ async def get_tweet_content_with_playwright_async(username, tweet_id):
                 }
             
             # Extra wait for JS to execute
-            await asyncio.sleep(random.uniform(2.0, 4.0))
+            extra_wait = random.uniform(2.0, 4.0)
+            logger.info(f"Waiting extra {extra_wait:.2f} seconds for JS rendering")
+            await asyncio.sleep(extra_wait)
             
             # Take screenshot with error handling
             try:
-                screenshot_path = os.path.join('.temp', 'screenshots', f"tweet_{username}_{tweet_id}_screenshot.png")
+                screenshot_path = f"tweet_{username}_{tweet_id}_screenshot.png"
                 await page.screenshot(path=screenshot_path)
                 logger.info(f"Saved screenshot to {screenshot_path}")
             except Exception as e:
@@ -420,7 +365,10 @@ async def get_tweet_content_with_playwright_async(username, tweet_id):
                         logger.warning(f"Text extraction failed, retrying ({retries} left)")
                         await asyncio.sleep(1)
                         # Sometimes scrolling helps render content
-                        await page.mouse.wheel(0, 50)
+                        try:
+                            await page.mouse.wheel(0, 50)
+                        except Exception as e:
+                            logger.warning(f"Scroll during retry failed: {e}")
                 except Exception as e:
                     logger.error(f"Error during text extraction: {e}")
                 
@@ -475,7 +423,10 @@ async def get_tweet_content_with_playwright_async(username, tweet_id):
                 logger.error(traceback.format_exc())
             
             # Clean up - close the context instead of a browser
-            await context.close()
+            try:
+                await context.close()
+            except Exception as e:
+                logger.warning(f"Error closing browser context: {e}")
             
             result = {
                 'text': tweet_text,
@@ -518,6 +469,30 @@ def get_tweet_content_with_playwright(username, tweet_id):
             'source': f"https://x.com/{username}/status/{tweet_id}"
         }
 
+def download_media(url, output_path):
+    """
+    Download media from URL to the specified path
+    Returns True if successful, False otherwise
+    """
+    try:
+        logger.info(f"Downloading media from {url}")
+        response = requests.get(url, stream=True, timeout=30)
+        
+        if response.status_code != 200:
+            logger.warning(f"Download received non-200 status code: {response.status_code}")
+            return False
+            
+        with open(output_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        logger.info(f"Successfully downloaded media to {output_path}")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error downloading media: {str(e)}")
+        return False
+
 def ensure_playwright_browsers():
     """Ensure Playwright browsers are installed"""
     import subprocess
@@ -534,5 +509,21 @@ def ensure_playwright_browsers():
         logger.error(f"Error installing Playwright browsers: {e}")
         logger.warning("You may need to manually run: python -m playwright install chromium")
 
-# At the end of the file
-ensure_playwright_browsers() 
+# Run browser installation check when module is imported
+ensure_playwright_browsers()
+
+# This allows for easy testing from the command line
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) == 3:
+        username = sys.argv[1]
+        tweet_id = sys.argv[2]
+        print(f"Testing tweet fetch for @{username}/status/{tweet_id}")
+        result = get_tweet_content(username, tweet_id)
+        
+        print("\nRESULT:")
+        print(f"Text: {result.get('text')}")
+        print(f"Media URLs: {result.get('media_urls')}")
+        print(f"Source: {result.get('source')}")
+    else:
+        print("Usage: python tweet_scraper.py <username> <tweet_id>") 

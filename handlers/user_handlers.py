@@ -150,9 +150,12 @@ def handle_twitter_link(bot, message):
         if tweet_content.get('media_urls'):
             for idx, media_url in enumerate(tweet_content['media_urls'][:4]):  # Limit to 4 media items
                 try:
-                    # Create temp file for the media
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_url)[1]) as tmp:
-                        tmp_path = tmp.name
+                    # Create temp file for the media in our .temp directory
+                    file_ext = os.path.splitext(media_url)[1]
+                    if not file_ext:
+                        file_ext = '.jpg'  # Default to jpg if no extension
+                    
+                    tmp_path = os.path.join('.temp', 'media', f"media_{tweet_id}_{idx}{file_ext}")
                     
                     # Download the media
                     if download_media(media_url, tmp_path):
@@ -171,7 +174,8 @@ def handle_twitter_link(bot, message):
                                 media_sent = True
                     
                     # Clean up temp file
-                    os.unlink(tmp_path)
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
                 except Exception as e:
                     print(f"Error sending media: {e}")
             
@@ -204,11 +208,14 @@ def handle_twitter_link(bot, message):
             if tweet_content and tweet_content.get('media_urls'):
                 for idx, media_url in enumerate(tweet_content['media_urls'][:1]):  # Just send first image
                     try:
-                        # Create temp file
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_url)[1]) as tmp:
-                            tmp_path = tmp.name
+                        # Create temp file for the media in our .temp directory
+                        file_ext = os.path.splitext(media_url)[1]
+                        if not file_ext:
+                            file_ext = '.jpg'  # Default to jpg if no extension
                         
-                        # Download and send
+                        tmp_path = os.path.join('.temp', 'media', f"media_{tweet_id}_{idx}{file_ext}")
+                        
+                        # Download the media
                         if download_media(media_url, tmp_path):
                             if any(media_url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
                                 with open(tmp_path, 'rb') as photo:
@@ -218,8 +225,9 @@ def handle_twitter_link(bot, message):
                                         reply_to_message_id=sent_message.message_id
                                     )
                         
-                        # Clean up
-                        os.unlink(tmp_path)
+                        # Clean up temp file
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
                     except Exception as e:
                         print(f"Error sending media to channel: {e}")
             

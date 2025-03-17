@@ -5,6 +5,7 @@ import re
 import logging
 import asyncio
 from playwright.async_api import async_playwright
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -12,6 +13,22 @@ logger = logging.getLogger('tweet_fetcher')
 
 # For tweet URL pattern matching
 TWEET_URL_PATTERN = r'https?://(?:www\.)?(twitter|x)\.com/(\w+)/status/(\d+)'
+
+# Create directories for temp files (at the top of the file after imports)
+def ensure_temp_dirs():
+    """Ensure all temporary directories exist"""
+    temp_dirs = [
+        '.temp',
+        '.temp/html',
+        '.temp/screenshots',
+        '.temp/media',
+        '.temp/profiles'
+    ]
+    for directory in temp_dirs:
+        os.makedirs(directory, exist_ok=True)
+
+# Call this when the module is imported
+ensure_temp_dirs()
 
 def extract_tweet_info(url):
     """Extract username and tweet ID from Twitter/X URL"""
@@ -102,7 +119,12 @@ def get_tweet_metadata(username, tweet_id):
             
             # Log more details
             logger.info(f"Response size: {len(response.text)} bytes")
-            logger.info(f"Response type: {response.headers.get('Content-Type')}")
+            
+            # Save the HTML for debugging - updated path
+            debug_path = os.path.join('.temp', 'html', f"debug_tweet_{username}_{tweet_id}.html")
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(response.text)
+            logger.info(f"Saved HTML to {debug_path}")
             
             # Dump all meta tags for debugging
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -235,8 +257,8 @@ async def get_tweet_content_with_playwright_async(username, tweet_id):
             # Use persistent context approach instead of args
             browser_type = p.chromium
             
-            # Define the user data directory
-            user_data_dir = "/tmp/playwright_profile"
+            # Define the user data directory - updated to use .temp folder
+            user_data_dir = os.path.join(os.getcwd(), ".temp", "profiles", f"profile_{random.randint(1, 5)}")
             
             # More robust error handling when launching browser
             try:
@@ -367,7 +389,7 @@ async def get_tweet_content_with_playwright_async(username, tweet_id):
             
             # Take screenshot with error handling
             try:
-                screenshot_path = f"tweet_{username}_{tweet_id}_screenshot.png"
+                screenshot_path = os.path.join('.temp', 'screenshots', f"tweet_{username}_{tweet_id}_screenshot.png")
                 await page.screenshot(path=screenshot_path)
                 logger.info(f"Saved screenshot to {screenshot_path}")
             except Exception as e:

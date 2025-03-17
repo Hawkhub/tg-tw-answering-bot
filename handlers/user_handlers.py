@@ -1,12 +1,12 @@
 import re
 import os
 from datetime import datetime
-import tempfile
 from config import AUTHORIZED_USERS, MESSAGE_STORAGE_FILE, CHANNEL
 from storage import save_message
 from search import search_stored_messages, search_exported_html
 from tweet_fetcher import get_tweet_content, download_media
 from handlers.channel_handlers import post_tweet_to_channel
+import telebot
 
 def handle_welcome(bot, message):
     """Handle /start and /hello commands"""
@@ -138,61 +138,93 @@ def handle_twitter_link(bot, message):
     tweet_content = get_tweet_content(twitter_username, tweet_id)
     
     if tweet_content and (tweet_content.get('text') or tweet_content.get('media_urls')):
-        # Send tweet content to user
-        content_msg = f"📝 Tweet content:\n\n"
+        # Send tweet content and media to user in a consolidated message
+        content_msg = ""
         if tweet_content.get('text'):
             content_msg += f"{tweet_content['text']}\n\n"
         content_msg += f"Source: {tweet_content['source']}"
         
-        user_msg = bot.send_message(message.chat.id, content_msg)
-        
-        # Send media if available with improved type detection
-        media_sent = False
+        # Check if we have media
         if tweet_content.get('media_urls'):
-            for idx, media_url in enumerate(tweet_content['media_urls'][:4]):  # Limit to 4 media items
-                try:
-                    # Create temp file for the media in our .temp directory
+            media_files = []
+            temp_files = []  # Track temp files for cleanup
+            
+            try:
+                # Process up to 10 media items (Telegram's limit for media groups)
+                for idx, media_url in enumerate(tweet_content['media_urls'][:10]):
+                    # Determine file type
                     file_ext = os.path.splitext(media_url)[1].lower()
                     if not file_ext:
-                        # Default to jpg if no extension
-                        file_ext = '.jpg'
+                        file_ext = '.jpg'  # Default to jpg if no extension
                     
-                    tmp_path = os.path.join('.temp', 'media', f"media_{tweet_id}_{idx}{file_ext}")
+                    # Create temp file path
+                    tmp_path = os.path.join('.temp', 'media', f"media_user_{tweet_id}_{idx}{file_ext}")
                     
                     # Download the media
                     if download_media(media_url, tmp_path):
-                        # Enhanced media type detection
-                        if file_ext in ['.jpg', '.jpeg', '.png']:
-                            # Static images
-                            with open(tmp_path, 'rb') as photo:
-                                bot.send_photo(message.chat.id, photo)
-                                media_sent = True
-                        elif file_ext == '.gif':
-                            # Animated GIFs should use send_animation
-                            with open(tmp_path, 'rb') as animation:
-                                bot.send_animation(message.chat.id, animation)
-                                media_sent = True
-                        elif file_ext in ['.mp4', '.mov', '.avi', '.webm']:
-                            # Videos
-                            with open(tmp_path, 'rb') as video:
-                                bot.send_video(message.chat.id, video)
-                                media_sent = True
+                        temp_files.append(tmp_path)  # Track for cleanup
+                        
+                        # Create appropriate media object based on file type
+                        if idx == 0:
+                            # First media gets the caption
+                            if file_ext in ['.jpg', '.jpeg', '.png']:
+                                media_files.append(telebot.types.InputMediaPhoto(
+                                    open(tmp_path, 'rb'), 
+                                    caption=content_msg
+                                ))
+                            elif file_ext == '.gif':
+                                # Note: GIFs will be converted to videos in media groups
+                                media_files.append(telebot.types.InputMediaVideo(
+                                    open(tmp_path, 'rb'), 
+                                    caption=content_msg,
+                                    supports_streaming=True
+                                ))
+                            elif file_ext in ['.mp4', '.mov', '.avi', '.webm']:
+                                media_files.append(telebot.types.InputMediaVideo(
+                                    open(tmp_path, 'rb'), 
+                                    caption=content_msg,
+                                    supports_streaming=True
+                                ))
                         else:
-                            # Other file types or unknown
-                            with open(tmp_path, 'rb') as doc:
-                                bot.send_document(message.chat.id, doc)
-                                media_sent = True
-                    
-                    # Clean up temp file
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-                except Exception as e:
-                    print(f"Error sending media: {e}")
-                    import traceback
-                    print(traceback.format_exc())
+                            # Additional media without caption
+                            if file_ext in ['.jpg', '.jpeg', '.png']:
+                                media_files.append(telebot.types.InputMediaPhoto(
+                                    open(tmp_path, 'rb')
+                                ))
+                            elif file_ext in ['.mp4', '.mov', '.avi', '.webm', '.gif']:
+                                media_files.append(telebot.types.InputMediaVideo(
+                                    open(tmp_path, 'rb'),
+                                    supports_streaming=True
+                                ))
+                
+                # Send as media group if we have media
+                if media_files:
+                    bot.send_media_group(
+                        chat_id=message.chat.id,
+                        media=media_files
+                    )
+                    media_sent = True
+                
+            except Exception as e:
+                print(f"Error sending media group to user: {e}")
+                import traceback
+                print(traceback.format_exc())
+                
+                # Fall back to text-only message
+                if not media_sent:
+                    bot.send_message(message.chat.id, content_msg)
             
-            if not media_sent:
-                bot.send_message(message.chat.id, "⚠️ Could not download or send media files.")
+            finally:
+                # Clean up temp files
+                for tmp_path in temp_files:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception as e:
+                            print(f"Error removing temp file {tmp_path}: {e}")
+        else:
+            # No media, just send text
+            bot.send_message(message.chat.id, content_msg)
     else:
         bot.send_message(message.chat.id, "⚠️ Could not retrieve tweet content.")
     

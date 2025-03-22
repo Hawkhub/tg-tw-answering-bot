@@ -1,7 +1,7 @@
 from config import CHANNEL
 from storage import save_message
 import os
-from tweet_fetcher import download_media
+from tweet_fetcher import download_media, get_tweet_content, extract_tweet_info
 import telebot
 
 def handle_channel_post(bot, message):
@@ -164,3 +164,84 @@ def post_tweet_to_channel(bot, channel_id, tweet_content, twitter_username, twee
         result['error'] = str(e)
     
     return result 
+
+def parse_cookie_table(cookie_table_text):
+    """
+    Parse a cookie table text (copied from browser dev tools) into a dictionary
+    
+    Args:
+        cookie_table_text (str): Tab-separated cookie table text from browser
+        
+    Returns:
+        dict: Dictionary of cookie name-value pairs
+    """
+    cookies = {}
+    
+    # Skip the header row
+    lines = cookie_table_text.strip().split('\n')
+    if not lines:
+        return cookies
+        
+    for line in lines:
+        parts = line.split('\t')
+        if len(parts) < 2:  # Need at least name and value
+            continue
+            
+        name = parts[0].strip()
+        value = parts[1].strip()
+        
+        # Only include non-empty cookies
+        if name and value:
+            cookies[name] = value
+            
+    return cookies
+
+async def handle_x_tweet(message, client):
+    """Handler for X/Twitter tweet links"""
+    
+    # Your X authentication cookies - this could be stored in config or environment
+    x_cookies_text = """__cf_bm	Jmnk7_X0Q7RQuF_8dQdDurVovwH3G.HcZdCUlGLoXYI-1742641461-1.0.1.1-tXPuyuO7BbngM8E04Ow9v5fY7k0rgw78DbUzdrAGzf4dMEdeCJ5Kf1ZsQgF1kqj0VDjn1HPI6ibPIP9JxlenDlAYOARL18sq53_jTv3fxxQ	.x.com	/	2025-03-22T11:34:21.856Z	177	✓	✓	None			Medium	
+__cf_bm	A9CE_Cs5HPML1a4cQ9EbhnYamCPkLZ.qKm68uhW7n.A-1742640699-1.0.1.1-cs3CvAjBB5iSFnjtamUt6MHMom1MN9iK.nsq3_AwTr.kKLV.aHGvTYS_3cuHuOYXfcd2LJlEJGFoqongajGb08.rBDIDcD5dpSOcI1CDVrg	.twitter.com	/	2025-03-22T11:21:39.370Z	177	✓	✓	None			Medium	
+auth_multi	"136618804:755a6669542eb0cb257839435447015b65b5ad9a|811128179884781568:ac7ab9a86798794ad5e0cdd4258bf9cdf78b503b"	.x.com	/	2026-04-22T10:52:25.699Z	122	✓	✓	Lax			Medium	
+auth_token	a1f73b6cc7fefbd4466df9a4d651740c100bda65	.x.com	/	2026-04-22T10:11:12.855Z	50	✓	✓	None			Medium	
+ct0	4a6dffb4c9220de970a2d15c760de0ad95198863f09e61690c3701898bf9c6414437935d5cd9132d2256f80ca03e1dd819b804e3bcef0dfd3925f6fabbcc1ddc93a039e5679d739afd488f0c179607b4	.x.com	/	2026-04-22T10:11:13.306Z	163		✓	Lax			Medium	
+d_prefs	MToxLGNvbnNlbnRfdmVyc2lvbjoyLHRleHRfdmVyc2lvbjoxMDAw	.x.com	/	2025-07-09T14:39:48.194Z	59		✓				Medium	
+dnt	1	.x.com	/	2026-04-22T10:11:12.855Z	4		✓	None			Medium	
+guest_id	v1%3A174263827279062459	.x.com	/	2026-04-22T10:11:13.306Z	31		✓	None			Medium	
+guest_id_ads	v1%3A169549221149633047	.x.com	/	2026-02-10T14:39:48.651Z	35		✓	None			Medium	
+guest_id_marketing	v1%3A169549221149633047	.x.com	/	2026-02-10T14:39:48.651Z	41		✓	None			Medium	
+kdt	SjKe4XI7Zdlsl4R4iRX5KgG8KGLD78jNpBW04OwZ	.x.com	/	2026-04-22T10:11:12.855Z	43	✓	✓				Medium	
+lang	en	x.com	/	Session	6						Medium	
+personalization_id	"v1_0T0QSTka1kLapeR2HhYJTg=="	.x.com	/	2026-03-17T20:04:28.481Z	47		✓	None			Medium	
+twid	u%3D1306736056985948162	.x.com	/	2026-03-22T10:52:28.894Z	27		✓	None			Medium"""
+    
+    # Parse cookies from the text table
+    x_cookies = parse_cookie_table(x_cookies_text)
+    
+    # Extract username and tweet_id from the URL
+    url = message.content.strip()
+    username, tweet_id = extract_tweet_info(url)
+    
+    if not username or not tweet_id:
+        await message.channel.send("Unable to extract tweet information from the URL.")
+        return
+    
+    # Inform user we're processing
+    await message.channel.send(f"Fetching tweet from @{username}. This may take a moment...")
+    
+    # Get tweet content with full cookie authentication
+    result = get_tweet_content(username, tweet_id, cookies=x_cookies)
+    
+    # Handle the result - share text and media
+    if result['text']:
+        await message.channel.send(f"**@{username}**: {result['text']}")
+    
+    # Send media files if any
+    for media_url in result['media_urls'][:4]:  # Limit to 4 media items
+        try:
+            await message.channel.send(media_url)
+        except Exception as e:
+            await message.channel.send(f"Error sending media: {str(e)}")
+    
+    if not result['text'] and not result['media_urls']:
+        await message.channel.send("Unable to retrieve tweet content.") 

@@ -1,0 +1,9 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+
+# Your rule content
+
+- For testing scripts use venv. Specifically, refer to the Usage section of README.md

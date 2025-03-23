@@ -17,7 +17,8 @@ def search_stored_messages(query):
         # Filter messages containing the query
         matching_messages = []
         for msg in messages:
-            if "text" in msg and query.lower() in msg["text"].lower():
+            # Check if text field exists and is not None before calling lower()
+            if "text" in msg and msg["text"] is not None and query.lower() in msg["text"].lower():
                 matching_messages.append(msg)
         
         # Sort by date, newest first

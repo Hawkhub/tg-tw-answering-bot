@@ -4,3 +4,5 @@ python-dotenv==1.0.0
 pyTelegramBotAPI==4.11.0
 beautifulsoup4
 playwright
+aiohttp
+asyncio

@@ -6,8 +6,8 @@ import asyncio
 
 from .utils.directories import ensure_temp_dirs
 from .config import TWEET_URL_PATTERN
-from .extractors import extract_tweet_sync, ExtractorType
-from .utils.media import download_media, download_all_media  # Import media functions
+from .extractors import extract_tweet_sync, extract_tweet_combined_sync, ExtractorType
+from .utils.media import download_media as async_download_media, download_all_media, get_debug_directory  # Import media functions
 # Import X credentials from main config
 from config import X_USERNAME, X_PASSWORD
 
@@ -17,6 +17,55 @@ logger = logging.getLogger('tweet_fetcher')
 
 # Ensure temp directories exist
 ensure_temp_dirs()
+
+# Create a synchronous wrapper for the async download_media function
+def download_media(url, output_path):
+    """
+    Synchronous wrapper for async download_media function
+    
+    Args:
+        url (str): Media URL to download
+        output_path (str): Full path where to save the file
+        
+    Returns:
+        str: Path to downloaded file or None if failed
+    """
+    try:
+        # Get directory from output_path
+        output_dir = os.path.dirname(output_path)
+        
+        # Ensure directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create an event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Run the async function
+        result = loop.run_until_complete(async_download_media(url, output_dir))
+        
+        # Close the loop
+        loop.close()
+        
+        # If the download was successful, rename the file to the expected output_path
+        if result:
+            # Rename only if the result path is different from the expected path
+            if result != output_path and os.path.exists(result):
+                # If target file already exists, remove it
+                if os.path.exists(output_path):
+                    os.unlink(output_path)
+                    
+                # Rename/move the file
+                os.rename(result, output_path)
+                logger.info(f"Renamed {result} to {output_path}")
+                return output_path
+            return result
+        return None
+    except Exception as e:
+        logger.error(f"Error in synchronous download_media: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
 
 # Create a shutdown function to properly close all browser sessions
 async def _shutdown_browser_sessions():
@@ -78,7 +127,8 @@ def get_tweet_content(username, tweet_id, use_auth=False, auth_username=None, au
     Returns:
         dict: Tweet content with text, media_urls and source
     """
-    methods = [ExtractorType.PLAYWRIGHT, ExtractorType.METADATA]
+    # Create a list of all extraction methods to try
+    methods = [ExtractorType.PLAYWRIGHT, ExtractorType.METADATA, ExtractorType.VIDEO_DOWNLOADER]
     
     # Use environment credentials if not provided directly
     if auth_username is None and X_USERNAME:
@@ -95,8 +145,8 @@ def get_tweet_content(username, tweet_id, use_auth=False, auth_username=None, au
         # Add auth method as first priority
         methods.insert(0, ExtractorType.AUTH_PLAYWRIGHT)
         
-    # Pass authentication details to the extractor
-    return extract_tweet_sync(
+    # Pass authentication details to the combined extractor
+    return extract_tweet_combined_sync(
         username, 
         tweet_id, 
         methods, 
@@ -121,7 +171,7 @@ def get_tweet_from_url(url, use_auth=False, auth_username=None, auth_password=No
     """
     username, tweet_id = extract_tweet_info(url)
     if username and tweet_id:
-        return get_tweet_content(
+        result = get_tweet_content(
             username, 
             tweet_id, 
             use_auth=use_auth, 
@@ -129,12 +179,17 @@ def get_tweet_from_url(url, use_auth=False, auth_username=None, auth_password=No
             auth_password=auth_password,
             auth_phone=auth_phone
         )
+        
+        # Make sure the original source URL is included
+        result['source'] = url
+        return result
     else:
         logger.error(f"Invalid tweet URL: {url}")
         return {
             'text': f"Invalid tweet URL: {url}",
             'media_urls': [],
-            'source': url
+            'source': url,
+            'error': "Invalid tweet URL"
         }
 
 # Export media functions so they can be imported directly from tweet_fetcher
@@ -144,6 +199,9 @@ __all__ = [
     'download_media',
     'download_all_media',
     'ExtractorType',
+    'extract_tweet_combined_sync',
+    'get_debug_directory',
+    'test_video_download',
     'shutdown'
 ]
 
@@ -179,7 +237,30 @@ def test_tweet_fetch(username, tweet_id, use_auth=False, auth_username=None, aut
     
     print("\nRESULT:")
     print(f"Text: {result.get('text')}")
-    print(f"Media URLs: {result.get('media_urls')}")
+    print(f"Media URLs ({len(result.get('media_urls', []))}): {result.get('media_urls')}")
     print(f"Source: {result.get('source')}")
+    print(f"Error: {result.get('error')}")
     
     return result 
+
+def test_video_download(url):
+    """
+    Test function to download video from tweet URL
+    
+    Args:
+        url (str): Tweet URL
+        
+    Returns:
+        None
+    """
+    # Run the test script with the provided URL
+    import subprocess
+    import sys
+    import os
+    
+    script_path = os.path.join(os.path.dirname(__file__), 'test_video.py')
+    
+    print(f"Testing video download from {url}")
+    print(f"Debug files will be saved to {get_debug_directory()}")
+    
+    subprocess.run([sys.executable, script_path, url]) 

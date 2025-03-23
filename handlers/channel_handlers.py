@@ -3,6 +3,7 @@ from storage import save_message
 import os
 from tweet_fetcher import download_media
 import telebot
+from tweet_fetcher.config import MEDIA_DIR
 
 def handle_channel_post(bot, message):
     """Handle posts from channels"""
@@ -58,14 +59,15 @@ def post_tweet_to_channel(bot, channel_id, tweet_content, twitter_username, twee
             
             try:
                 # Prepare media group
+                media_sent = False  # Initialize before try block
                 for idx, media_url in enumerate(tweet_content['media_urls'][:10]):  # Telegram allows up to 10 items
                     # Determine file type
                     file_ext = os.path.splitext(media_url)[1].lower()
                     if not file_ext:
                         file_ext = '.jpg'  # Default to jpg if no extension
                     
-                    # Create temp file path
-                    tmp_path = os.path.join('.temp', 'media', f"media_channel_{tweet_id}_{idx}{file_ext}")
+                    # Create temp file path using the config path
+                    tmp_path = os.path.join(MEDIA_DIR, f"media_channel_{tweet_id}_{idx}{file_ext}")
                     
                     # Download the media
                     if download_media(media_url, tmp_path):

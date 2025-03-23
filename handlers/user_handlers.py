@@ -148,6 +148,7 @@ def handle_twitter_link(bot, message):
         if tweet_content.get('media_urls'):
             media_files = []
             temp_files = []  # Track temp files for cleanup
+            media_sent = False  # Initialize media_sent variable before try block
             
             try:
                 # Process up to 10 media items (Telegram's limit for media groups)
@@ -157,8 +158,9 @@ def handle_twitter_link(bot, message):
                     if not file_ext:
                         file_ext = '.jpg'  # Default to jpg if no extension
                     
-                    # Create temp file path
-                    tmp_path = os.path.join('.temp', 'media', f"media_user_{tweet_id}_{idx}{file_ext}")
+                    # Create temp file path - use the absolute path from tweet_fetcher config
+                    from tweet_fetcher.config import MEDIA_DIR
+                    tmp_path = os.path.join(MEDIA_DIR, f"media_user_{tweet_id}_{idx}{file_ext}")
                     
                     # Download the media
                     if download_media(media_url, tmp_path):

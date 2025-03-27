@@ -33,12 +33,13 @@ class BaseExtractor(ABC):
     
     def get_empty_result(self, error_message=None):
         """Get empty result with optional error message"""
-        text = error_message
-        if not text:
-            text = f"Tweet by @{self.username} - Content could not be retrieved automatically."
+        error = error_message
+        if not error:
+            error = f"Tweet by @{self.username} - Content could not be retrieved automatically."
             
         return {
-            'text': text,
+            'text': "",
             'media_urls': [],
-            'source': self.source_url
+            'source': self.source_url,
+            'error': error
         } 

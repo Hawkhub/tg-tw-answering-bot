@@ -14,7 +14,7 @@ logger = logging.getLogger('tweet_fetcher')
 class AuthPlaywrightExtractor(PlaywrightExtractor):
     """Extract tweet content using authenticated Playwright session"""
     
-    def __init__(self, username, tweet_id, auth_username=None, auth_password=None, auth_phone=None):
+    def __init__(self, username, tweet_id, auth_username=None, auth_password=None, auth_phone=None, record_video=False, record_quality='medium'):
         """
         Initialize the extractor
         
@@ -24,11 +24,15 @@ class AuthPlaywrightExtractor(PlaywrightExtractor):
             auth_username (str): Username for authentication
             auth_password (str): Password for authentication
             auth_phone (str): Phone number for verification
+            record_video (bool): Whether to record the extraction process
+            record_quality (str): Recording quality (low: 480p, medium: 720p, high: 1080p)
         """
         super().__init__(username, tweet_id)
         self.auth_username = auth_username
         self.auth_password = auth_password
         self.auth_phone = auth_phone
+        self.record_video = record_video
+        self.record_quality = record_quality
         
         # If phone is not provided, try to get from environment
         if not self.auth_phone:
@@ -45,7 +49,9 @@ class AuthPlaywrightExtractor(PlaywrightExtractor):
                 self.playwright, self.context, self.auth_manager = await BrowserSessionManager.get_browser_session(
                     username=self.auth_username,
                     password=self.auth_password,
-                    phone_number=self.auth_phone
+                    phone_number=self.auth_phone,
+                    record_video=self.record_video,
+                    record_quality=self.record_quality
                 )
             except Exception as e:
                 logger.error(f"Failed to get browser session: {e}")

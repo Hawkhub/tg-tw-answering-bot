@@ -8,6 +8,14 @@ from tweet_fetcher import get_tweet_content, download_media
 from handlers.channel_handlers import post_tweet_to_channel
 import telebot
 
+# Import recording settings from bot.py
+try:
+    from bot import ENABLE_RECORDING, RECORDING_QUALITY
+except ImportError:
+    # Default values if not imported
+    ENABLE_RECORDING = False
+    RECORDING_QUALITY = 'medium'
+
 def handle_welcome(bot, message):
     """Handle /start and /hello commands"""
     bot.reply_to(message, "Howdy, how are you doing?")
@@ -135,7 +143,12 @@ def handle_twitter_link(bot, message):
     
     # Get tweet content (do this regardless of whether we found previous mentions)
     bot.send_message(message.chat.id, "📥 Fetching tweet content...")
-    tweet_content = get_tweet_content(twitter_username, tweet_id)
+    tweet_content = get_tweet_content(
+        twitter_username, 
+        tweet_id,
+        record_video=ENABLE_RECORDING,
+        record_quality=RECORDING_QUALITY
+    )
     
     if tweet_content and (tweet_content.get('text') or tweet_content.get('media_urls')):
         # Send tweet content and media to user in a consolidated message
@@ -248,6 +261,7 @@ def handle_twitter_link(bot, message):
             else:
                 bot.reply_to(message, f"✅ Posted the tweet to the channel as a new message")
         else:
+            # Send error message only to the user, never to the channel
             bot.reply_to(message, f"❌ Error posting to channel: {result['error']}")
     else:
         bot.reply_to(message, "⚠️ Couldn't post to channel: missing channel ID.") 

@@ -38,10 +38,13 @@ def post_tweet_to_channel(bot, channel_id, tweet_content, twitter_username, twee
     }
     
     try:
-        # Build the X.com URL and caption text
+        # Build the X.com URL
         reconstructed_link = f"https://x.com/{twitter_username}/status/{tweet_id}"
         
-        # Build message caption
+        # Build message caption in the EXACT required format:
+        # "{text from tweet}" (not present if no text)
+        # 
+        # {x post link}
         caption = ""
         if tweet_content and tweet_content.get('text'):
             # Add tweet text if available (limit to ~1000 chars for caption)
@@ -123,6 +126,7 @@ def post_tweet_to_channel(bot, channel_id, tweet_content, twitter_username, twee
                     result['message'] = sent_messages[0]  # Return first message as reference
                 
             except Exception as e:
+                # Only log errors, never include them in channel messages
                 print(f"Error sending media group: {e}")
                 import traceback
                 print(traceback.format_exc())
@@ -161,6 +165,7 @@ def post_tweet_to_channel(bot, channel_id, tweet_content, twitter_username, twee
     except Exception as e:
         import traceback
         error_tb = traceback.format_exc()
+        # Log the error but never include in channel messages
         print(f"Error posting to channel: {e}")
         print(error_tb)
         result['error'] = str(e)

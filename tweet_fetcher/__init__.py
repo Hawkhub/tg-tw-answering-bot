@@ -37,15 +37,44 @@ def download_media(url, output_path):
         # Ensure directory exists
         os.makedirs(output_dir, exist_ok=True)
         
-        # Create an event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Try to get existing event loop or create a new one
+        try:
+            loop = asyncio.get_event_loop()
+            new_loop_created = False
+        except RuntimeError:
+            # No event loop in this thread, create a new one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            new_loop_created = True
         
         # Run the async function
-        result = loop.run_until_complete(async_download_media(url, output_dir))
+        if loop.is_running():
+            # If the loop is already running (we're in an async context)
+            # Create a future and run the download in a task
+            future = asyncio.run_coroutine_threadsafe(
+                async_download_media(url, output_dir),
+                loop
+            )
+            result = future.result(timeout=60)  # 1-minute timeout
+        else:
+            # If the loop is not running, use run_until_complete
+            result = loop.run_until_complete(async_download_media(url, output_dir))
         
-        # Close the loop
-        loop.close()
+        # Close the loop only if we created it
+        if new_loop_created:
+            try:
+                # Run any pending tasks before closing
+                pending = [task for task in asyncio.all_tasks(loop)
+                           if not task.done() and task != asyncio.current_task(loop)]
+                
+                if pending:
+                    logger.info(f"Waiting for {len(pending)} pending tasks to complete...")
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception as e:
+                logger.warning(f"Error during cleanup of pending tasks: {e}")
+                
+            # Now close the loop
+            loop.close()
         
         # If the download was successful, rename the file to the expected output_path
         if result:
@@ -79,6 +108,8 @@ async def _shutdown_browser_sessions():
         logger.info("All browser sessions closed successfully")
     except Exception as e:
         logger.error(f"Error during browser shutdown: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 def shutdown():
     """Cleanup function to ensure all resources are properly released"""
@@ -86,19 +117,46 @@ def shutdown():
     
     # Run the async shutdown in an event loop
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # If we're in an async context already
-            future = asyncio.ensure_future(_shutdown_browser_sessions())
-            # We could wait but this might block - depends on your application
-        else:
-            # If we're not in an async context, create a new loop
+        # First try to get the current event loop
+        try:
+            loop = asyncio.get_event_loop()
+            new_loop_created = False
+        except RuntimeError:
+            # No event loop in this thread, create a new one
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            new_loop_created = True
+        
+        # Run the browser shutdown task
+        if loop.is_running():
+            # If we're in an async context already, use run_coroutine_threadsafe
+            future = asyncio.run_coroutine_threadsafe(_shutdown_browser_sessions(), loop)
+            # Wait for the future to complete with a timeout
+            future.result(timeout=30)  # 30-second timeout
+        else:
+            # If we're not in an async context, use run_until_complete
             loop.run_until_complete(_shutdown_browser_sessions())
+        
+        # Close the loop only if we created it
+        if new_loop_created:
+            try:
+                # Run any pending tasks before closing
+                pending = [task for task in asyncio.all_tasks(loop)
+                           if not task.done() and task != asyncio.current_task(loop)]
+                if pending:
+                    logger.info(f"Waiting for {len(pending)} pending tasks to complete...")
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception as e:
+                logger.warning(f"Error during cleanup of pending tasks: {e}")
+            
+            # Now close the loop
             loop.close()
+            
+        logger.info("Tweet fetcher shutdown completed successfully")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 # Register shutdown function to be called on exit
 atexit.register(shutdown)
@@ -112,7 +170,7 @@ def extract_tweet_info(url):
         return username, tweet_id
     return None, None
 
-def get_tweet_content(username, tweet_id, use_auth=False, auth_username=None, auth_password=None, auth_phone=None):
+def get_tweet_content(username, tweet_id, use_auth=False, auth_username=None, auth_password=None, auth_phone=None, record_video=False, record_quality='medium'):
     """
     Multi-tiered approach to get tweet content
     
@@ -123,13 +181,17 @@ def get_tweet_content(username, tweet_id, use_auth=False, auth_username=None, au
         auth_username (str): X/Twitter username for authentication
         auth_password (str): X/Twitter password for authentication
         auth_phone (str): X/Twitter phone number for verification
+        record_video (bool): Whether to record video of the extraction process
+        record_quality (str): Recording quality ('low', 'medium', 'high')
         
     Returns:
         dict: Tweet content with text, media_urls and source
     """
     # Create a list of all extraction methods to try
-    methods = [ExtractorType.PLAYWRIGHT, ExtractorType.METADATA, ExtractorType.VIDEO_DOWNLOADER]
-    
+    # Make AUTH_PLAYWRIGHT the primary method, followed by others
+    # methods = [ExtractorType.AUTH_PLAYWRIGHT, ExtractorType.PLAYWRIGHT, ExtractorType.METADATA, ExtractorType.VIDEO_DOWNLOADER]
+    methods = [ExtractorType.AUTH_PLAYWRIGHT]
+
     # Use environment credentials if not provided directly
     if auth_username is None and X_USERNAME:
         auth_username = X_USERNAME
@@ -140,11 +202,6 @@ def get_tweet_content(username, tweet_id, use_auth=False, auth_username=None, au
     if auth_phone is None and os.environ.get('X_PHONE_NUMBER'):
         auth_phone = os.environ.get('X_PHONE_NUMBER')
     
-    # If authentication is requested and we have credentials
-    if use_auth and auth_username and auth_password:
-        # Add auth method as first priority
-        methods.insert(0, ExtractorType.AUTH_PLAYWRIGHT)
-        
     # Pass authentication details to the combined extractor
     return extract_tweet_combined_sync(
         username, 
@@ -152,10 +209,12 @@ def get_tweet_content(username, tweet_id, use_auth=False, auth_username=None, au
         methods, 
         auth_username=auth_username, 
         auth_password=auth_password,
-        auth_phone=auth_phone
+        auth_phone=auth_phone,
+        record_video=record_video,
+        record_quality=record_quality
     )
 
-def get_tweet_from_url(url, use_auth=False, auth_username=None, auth_password=None, auth_phone=None):
+def get_tweet_from_url(url, use_auth=False, auth_username=None, auth_password=None, auth_phone=None, record_video=False, record_quality='medium'):
     """
     Extract tweet content from a URL
     
@@ -165,6 +224,8 @@ def get_tweet_from_url(url, use_auth=False, auth_username=None, auth_password=No
         auth_username (str): X/Twitter username for authentication
         auth_password (str): X/Twitter password for authentication
         auth_phone (str): X/Twitter phone number for verification
+        record_video (bool): Whether to record video of the extraction process
+        record_quality (str): Recording quality ('low', 'medium', 'high')
         
     Returns:
         dict: Tweet content with text, media_urls and source
@@ -177,7 +238,9 @@ def get_tweet_from_url(url, use_auth=False, auth_username=None, auth_password=No
             use_auth=use_auth, 
             auth_username=auth_username, 
             auth_password=auth_password,
-            auth_phone=auth_phone
+            auth_phone=auth_phone,
+            record_video=record_video,
+            record_quality=record_quality
         )
         
         # Make sure the original source URL is included
@@ -186,7 +249,7 @@ def get_tweet_from_url(url, use_auth=False, auth_username=None, auth_password=No
     else:
         logger.error(f"Invalid tweet URL: {url}")
         return {
-            'text': f"Invalid tweet URL: {url}",
+            'text': "",  # Keep text empty, don't include error messages in text field
             'media_urls': [],
             'source': url,
             'error': "Invalid tweet URL"
@@ -222,10 +285,7 @@ def test_tweet_fetch(username, tweet_id, use_auth=False, auth_username=None, aut
     if auth_phone is None and os.environ.get('X_PHONE_NUMBER'):
         auth_phone = os.environ.get('X_PHONE_NUMBER')
     
-    # Force authentication if credentials are available
-    if auth_username and auth_password:
-        use_auth = True
-        
+    # AUTH_PLAYWRIGHT is now the primary method by default
     result = get_tweet_content(
         username, 
         tweet_id, 
@@ -241,7 +301,7 @@ def test_tweet_fetch(username, tweet_id, use_auth=False, auth_username=None, aut
     print(f"Source: {result.get('source')}")
     print(f"Error: {result.get('error')}")
     
-    return result 
+    return result
 
 def test_video_download(url):
     """

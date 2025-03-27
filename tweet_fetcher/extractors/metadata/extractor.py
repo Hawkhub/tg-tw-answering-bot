@@ -40,7 +40,8 @@ class MetadataExtractor(BaseExtractor):
                     return {
                         'text': text,
                         'media_urls': image_urls,
-                        'source': self.source_url
+                        'source': self.source_url,
+                        'error': None  # No error
                     }
                     
         except Exception as e:
@@ -58,8 +59,8 @@ class MetadataExtractor(BaseExtractor):
                 content = re.sub(r'https://t\.co/\w+$', '', content).strip()
                 return content
         
-        # If we couldn't find content, return placeholder
-        return f"Tweet by @{self.username} - Text content could not be extracted from metadata."
+        # If we couldn't find content, return empty string (not an error message)
+        return ""
     
     def _extract_meta_images(self, soup):
         """Extract image URLs from meta tags"""

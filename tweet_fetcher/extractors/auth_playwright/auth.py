@@ -94,7 +94,7 @@ class TwitterAuth:
     
     async def is_authenticated(self, page):
         """
-        Check if the browser is authenticated to Twitter/X
+        Check if the browser is authenticated to Twitter/X using multiple signals
         
         Args:
             page: Playwright page object
@@ -109,34 +109,154 @@ class TwitterAuth:
             await page.screenshot(path=screenshot_path)
             logger.info(f"Saved authentication check screenshot to {screenshot_path}")
             
-            # Try to find elements that indicate we're logged in
-            home_link = await page.query_selector('a[data-testid="AppTabBar_Home_Link"]')
-            profile_icon = await page.query_selector('div[data-testid="SideNav_AccountSwitcher_Button"]')
-            
-            # If we found either element, we're logged in
-            if home_link or profile_icon:
-                logger.info("Browser is authenticated to Twitter/X")
-                return True
-            
-            # Check for login form elements which indicate we're not logged in
-            login_form = await page.query_selector('form[data-testid="LoginForm"]')
-            login_button = await page.query_selector('a[href="/login"]')
-            
-            if login_form or login_button:
-                logger.info("Browser is not authenticated to Twitter/X")
-                return False
-                
-            # If none of the above, try another approach
+            # First check if we previously stored an auth state
+            auth_state = self.get_auth_state()
             current_url = page.url
-            if "/home" in current_url:
-                logger.info("Browser appears authenticated (on home page)")
+            
+            # SIGNAL 1: Local auth state - fast but might be outdated
+            if auth_state and auth_state.get("authenticated", False):
+                logger.info("Found positive authentication state in local storage")
+                
+                # Don't rely solely on stored state, but use it as a positive signal
+                auth_signals = 1
+            else:
+                auth_signals = 0
+                
+            # SIGNAL 2: Check URL path
+            if "/home" in current_url or "/explore" in current_url or "/notifications" in current_url:
+                logger.info(f"URL indicates authentication: {current_url}")
+                auth_signals += 2  # Stronger signal from URL
+            
+            # SIGNAL 3: Check for authenticated UI elements
+            auth_ui_elements = [
+                'a[data-testid="AppTabBar_Home_Link"]',  # Home link in sidebar
+                'div[data-testid="SideNav_AccountSwitcher_Button"]',  # Profile icon
+                'a[data-testid="AppTabBar_Profile_Link"]',  # Profile link
+                'a[data-testid="AppTabBar_Explore_Link"]',  # Explore link
+                'a[data-testid="AppTabBar_Bookmarks_Link"]',  # Bookmarks link
+                'a[href="/compose/tweet"]',  # Tweet button
+                'div[data-testid="primaryColumn"]'  # Main column on home page
+            ]
+            
+            # Count how many authentication elements we can find
+            auth_element_count = 0
+            for selector in auth_ui_elements:
+                element = await page.query_selector(selector)
+                if element:
+                    auth_element_count += 1
+                    
+            logger.info(f"Found {auth_element_count} authenticated UI elements")
+            auth_signals += auth_element_count
+            
+            # SIGNAL 4: Check for login form elements (negative signal)
+            login_elements = [
+                'form[data-testid="LoginForm"]',
+                'input[name="text"][autocomplete="username"]',
+                'div[data-testid="loginButton"]',
+                'a[href="/i/flow/signup"]',
+                'a[data-testid="signupButton"]'
+            ]
+            
+            login_element_count = 0
+            for selector in login_elements:
+                element = await page.query_selector(selector)
+                if element:
+                    login_element_count += 1
+                    
+            logger.info(f"Found {login_element_count} login form elements")
+            
+            # SIGNAL 5: Check for user data in page content
+            has_user_data = False
+            try:
+                # Try to extract user data from window.__INITIAL_STATE__
+                user_data = await page.evaluate('''() => {
+                    try {
+                        // Try to find user data in state
+                        if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.entities) {
+                            return window.__INITIAL_STATE__.entities.users.current;
+                        } else if (window.__META_DATA__ && window.__META_DATA__.user) {
+                            return window.__META_DATA__.user;
+                        }
+                        return null;
+                    } catch (e) {
+                        return null;
+                    }
+                }''')
+                
+                if user_data:
+                    logger.info(f"Found user data in page: {user_data}")
+                    has_user_data = True
+                    auth_signals += 2  # Strong signal
+            except Exception as e:
+                logger.warning(f"Error checking for user data: {e}")
+            
+            # SIGNAL 6: Make a test API request that only works when authenticated
+            api_authenticated = False
+            try:
+                # Try to access an authenticated API
+                response = await page.evaluate('''() => {
+                    return new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open('GET', 'https://twitter.com/i/api/graphql/UGi7tjRPr-d_U3bCPIko5Q/HomeLatestTimeline', true);
+                        xhr.onload = function() {
+                            if (this.status >= 200 && this.status < 300) {
+                                resolve(true);
+                            } else {
+                                resolve(false);
+                            }
+                        };
+                        xhr.onerror = function() {
+                            resolve(false);
+                        };
+                        xhr.send();
+                        
+                        // Set a timeout
+                        setTimeout(() => resolve(false), 5000);
+                    });
+                }''')
+                
+                if response:
+                    logger.info("API request succeeded - authenticated")
+                    api_authenticated = True
+                    auth_signals += 3  # Strongest signal
+            except Exception as e:
+                logger.warning(f"Error checking API authentication: {e}")
+            
+            # DECISION LOGIC: Determine authentication based on signals
+            
+            # If we have strong API or user data confirmation, trust that
+            if api_authenticated or has_user_data:
+                logger.info("Definitively authenticated based on API/user data")
+                self.save_auth_state(True)
                 return True
                 
-            logger.warning("Unable to determine authentication status definitively")
-            return False
+            # If we have multiple UI signals but no login elements, probably authenticated
+            if auth_signals >= 3 and login_element_count == 0:
+                logger.info(f"Likely authenticated based on UI signals ({auth_signals})")
+                self.save_auth_state(True)
+                return True
+                
+            # If we have login elements and few auth signals, not authenticated
+            if login_element_count >= 2 or (login_element_count > 0 and auth_signals < 2):
+                logger.info("Not authenticated - login form present")
+                self.save_auth_state(False)
+                return False
+            
+            # Edge case - not enough clear signals either way
+            if auth_signals > login_element_count:
+                # More auth signals than login signals
+                logger.info(f"Probably authenticated (signals: {auth_signals}, login elements: {login_element_count})")
+                self.save_auth_state(True)
+                return True
+            else:
+                logger.info(f"Probably not authenticated (signals: {auth_signals}, login elements: {login_element_count})")
+                self.save_auth_state(False)
+                return False
             
         except Exception as e:
             logger.error(f"Error checking authentication status: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
     
     async def take_login_screenshot(self, page, step_name):

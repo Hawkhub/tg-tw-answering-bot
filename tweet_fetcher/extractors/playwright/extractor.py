@@ -21,6 +21,20 @@ logger = logging.getLogger('tweet_fetcher')
 class PlaywrightExtractor(BaseExtractor):
     """Extract tweet content using Playwright without auth"""
     
+    def __init__(self, username, tweet_id, record_video=False, record_quality='medium'):
+        """
+        Initialize the extractor
+        
+        Args:
+            username (str): Twitter/X username for the tweet
+            tweet_id (str): Tweet ID
+            record_video (bool): Whether to record the extraction process
+            record_quality (str): Recording quality (low: 480p, medium: 720p, high: 1080p)
+        """
+        super().__init__(username, tweet_id)
+        self.record_video = record_video
+        self.record_quality = record_quality
+    
     async def extract(self):
         """Extract tweet content using Playwright automation"""
         playwright = None
@@ -28,7 +42,7 @@ class PlaywrightExtractor(BaseExtractor):
         
         try:
             # Create browser context with stealth measures
-            playwright, browser_context = await create_browser_context()
+            playwright, browser_context = await create_browser_context(record_video=self.record_video, record_quality=self.record_quality)
             
             # Create a new page
             page = await browser_context.new_page()
@@ -66,7 +80,8 @@ class PlaywrightExtractor(BaseExtractor):
             except Exception as e:
                 logger.warning(f"Failed extracting with selector {selector}: {e}")
                 
-        return f"Tweet by @{self.username} - Text content could not be extracted."
+        # Return empty string instead of error message
+        return ""
 
     async def _extract_content_from_page(self, page):
         """Extract all content from a page"""
@@ -89,10 +104,17 @@ class PlaywrightExtractor(BaseExtractor):
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(html_content)
         
-        return {
+        result = {
             'text': text,
             'media_urls': media_urls,
             'source': self.source_url,
             'screenshot': screenshot_path,
-            'html': html_path
-        } 
+            'html': html_path,
+            'error': None  # No error
+        }
+        
+        # If we couldn't extract text or media, add an error but keep text field empty
+        if not text and not media_urls:
+            result['error'] = f"Could not extract content from tweet"
+            
+        return result 

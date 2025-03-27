@@ -1,93 +1,104 @@
 import random
 import logging
 import os
+import time
 from playwright.async_api import async_playwright
 
-from tweet_fetcher.config import USER_AGENTS, PROFILES_DIR
+from tweet_fetcher.config import USER_AGENTS, PROFILES_DIR, POPULAR_RESOLUTIONS, SCREENSHOTS_DIR
 
 logger = logging.getLogger('tweet_fetcher')
 
-async def create_browser_context(user_data_dir=None):
+async def create_browser_context(record_video=False, record_quality='medium'):
     """
-    Create a browser context with stealth and anti-detection measures
+    Create a browser context with stealth measures for tweet extraction
     
     Args:
-        user_data_dir (str): Optional path to a user data directory
-                            If None, a random profile will be used
-                            
+        record_video (bool): Whether to record the browser session
+        record_quality (str): Recording quality ('low', 'medium', 'high')
+    
     Returns:
-        tuple: (playwright instance, browser context)
+        tuple: (playwright, browser_context)
     """
-    logger.info("Creating browser context with stealth measures")
+    # Map quality settings to resolutions
+    quality_to_resolution = {
+        'low': {'width': 854, 'height': 480},
+        'medium': {'width': 1280, 'height': 720},
+        'high': {'width': 1920, 'height': 1080}
+    }
     
-    p = await async_playwright().start()
-    browser_type = p.chromium
+    # Default to medium if quality not found
+    video_size = quality_to_resolution.get(record_quality, quality_to_resolution['medium'])
     
-    # Create user data directory if not provided
-    if not user_data_dir:
-        profile_id = random.randint(1, 5)
-        user_data_dir = os.path.join(PROFILES_DIR, f"profile_{profile_id}")
+    # Generate a random viewport size that matches the recording resolution
+    if record_video:
+        viewport = video_size.copy()
+    else:
+        # Use a random resolution from config
+        viewport = random.choice(POPULAR_RESOLUTIONS)
     
-    # Randomized browser configuration
-    viewport = {"width": random.randint(1280, 1920), "height": random.randint(800, 1080)}
-    user_agent = random.choice(USER_AGENTS)
-    locale = random.choice(["en-US", "en-GB", "en-CA"])
-    timezone_id = random.choice(["America/New_York", "Europe/London", "Asia/Tokyo"])
-    color_scheme = random.choice(["light", "dark"])
-    device_scale_factor = random.choice([1, 2])
-    has_touch = random.choice([True, False])
-    
-    # Create browser context
     try:
-        context = await browser_type.launch_persistent_context(
-            user_data_dir,
+        playwright = await async_playwright().start()
+        
+        # Choose a random user agent
+        user_agent = random.choice(USER_AGENTS)
+        
+        # Setup recording options if enabled
+        recording_options = {}
+        if record_video:
+            # Create a unique filename for the recording
+            timestamp = int(time.time())
+            videos_dir = os.path.join(os.path.dirname(SCREENSHOTS_DIR), "videos")
+            os.makedirs(videos_dir, exist_ok=True)
+            
+            recording_options = {
+                "record_video_dir": videos_dir,
+                "record_video_size": video_size
+            }
+            
+        # Launch browser with anti-detection measures
+        browser = await playwright.chromium.launch(
             headless=True,
-            viewport=viewport,
-            user_agent=user_agent,
-            locale=locale,
-            timezone_id=timezone_id,
-            color_scheme=color_scheme,
-            device_scale_factor=device_scale_factor,
-            has_touch=has_touch,
-            is_mobile=False,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-web-security',
-                '--disable-site-isolation-trials'
-            ]
+            args=BROWSER_ARGS
         )
         
-        # Add fingerprint evasion
+        # Create a context with privacy and anti-fingerprinting measures
+        context = await browser.new_context(
+            viewport=viewport,
+            user_agent=user_agent,
+            locale=random.choice(['en-US', 'en-GB', 'en-CA']),
+            timezone_id=random.choice(['America/New_York', 'Europe/London', 'Asia/Tokyo']),
+            **recording_options
+        )
+        
+        # Stealth setup - prevent detection
         await context.add_init_script("""
-            // Override fingerprinting functions
-            const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                // Randomize certain WebGL parameters
-                if (parameter === 37445) {
-                    return 'Intel Inc.';
-                }
-                if (parameter === 37446) {
-                    return 'Intel Iris Graphics';
-                }
-                return originalGetParameter.call(this, parameter);
-            };
-            
-            // Spoof navigator properties
+            // Overwrite the navigator properties to make detection harder
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => false
             });
             
-            // Random plugins length to avoid fingerprinting
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => {
-                    return { length: Math.floor(Math.random() * 10) + 1 };
-                }
-            });
+            // Hide automation flags in Chrome
+            if (window.chrome) {
+                window.chrome.runtime = {};
+            }
+            
+            // Make permissions API return random values
+            if (navigator.permissions) {
+                const originalQuery = navigator.permissions.query;
+                navigator.permissions.query = (parameters) => {
+                    if (parameters.name === 'notifications' || parameters.name === 'geolocation') {
+                        return Promise.resolve({ state: "prompt" });
+                    }
+                    return originalQuery(parameters);
+                };
+            }
         """)
         
-        return p, context
+        # Return created browser and context
+        return playwright, context
+        
     except Exception as e:
-        await p.stop()
         logger.error(f"Failed to create browser context: {e}")
+        if 'playwright' in locals():
+            await playwright.stop()
         raise 

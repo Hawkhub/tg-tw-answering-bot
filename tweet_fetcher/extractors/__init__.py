@@ -13,7 +13,7 @@ class ExtractorType(Enum):
     VIDEO_DOWNLOADER = auto() # For fetching videos from downloader service
     
 
-async def extract_tweet(username, tweet_id, methods, auth_username=None, auth_password=None, auth_phone=None):
+async def extract_tweet(username, tweet_id, methods, auth_username=None, auth_password=None, auth_phone=None, record_video=False, record_quality='medium'):
     """
     Extract tweet content using specified methods in priority order
     
@@ -27,11 +27,15 @@ async def extract_tweet(username, tweet_id, methods, auth_username=None, auth_pa
         auth_username (str): Username for authentication 
         auth_password (str): Password for authentication
         auth_phone (str): Phone number for verification
+        record_video (bool): Whether to record the extraction process
+        record_quality (str): Recording quality ('low', 'medium', 'high')
         
     Returns:
         dict: Tweet content with text and media_urls
     """
     logger.info(f"Starting tweet extraction for @{username}/status/{tweet_id}")
+    if record_video:
+        logger.info(f"Screen recording enabled with {record_quality} quality")
     
     # Try each method in order
     for method in methods:
@@ -40,7 +44,15 @@ async def extract_tweet(username, tweet_id, methods, auth_username=None, auth_pa
             
             if method == ExtractorType.AUTH_PLAYWRIGHT:
                 from .auth_playwright.extractor import AuthPlaywrightExtractor
-                extractor = AuthPlaywrightExtractor(username, tweet_id, auth_username, auth_password, auth_phone)
+                extractor = AuthPlaywrightExtractor(
+                    username, 
+                    tweet_id, 
+                    auth_username, 
+                    auth_password, 
+                    auth_phone,
+                    record_video=record_video,
+                    record_quality=record_quality
+                )
                 result = await extractor.extract()
                 
                 # Check if we got meaningful content
@@ -53,7 +65,12 @@ async def extract_tweet(username, tweet_id, methods, auth_username=None, auth_pa
                     
             elif method == ExtractorType.PLAYWRIGHT:
                 from .playwright.extractor import PlaywrightExtractor
-                extractor = PlaywrightExtractor(username, tweet_id)
+                extractor = PlaywrightExtractor(
+                    username, 
+                    tweet_id,
+                    record_video=record_video,
+                    record_quality=record_quality
+                )
                 result = await extractor.extract()
                 
                 if result and result.get('text') and not result.get('error'):
@@ -81,16 +98,16 @@ async def extract_tweet(username, tweet_id, methods, auth_username=None, auth_pa
             logger.error(traceback.format_exc())
             continue
     
-    # If all methods failed, return empty result
+    # If all methods failed, return empty result with error field only, not in text field
     logger.error("All extraction methods failed")
     return {
-        'text': f"Failed to extract tweet from @{username}/status/{tweet_id}",
+        'text': "",  # Keep text empty, no error messages in text field
         'media_urls': [],
         'source': f"https://x.com/{username}/status/{tweet_id}",
         'error': "All extraction methods failed"
     }
 
-def extract_tweet_sync(username, tweet_id, methods, auth_username=None, auth_password=None, auth_phone=None):
+def extract_tweet_sync(username, tweet_id, methods, auth_username=None, auth_password=None, auth_phone=None, record_video=False, record_quality='medium'):
     """
     Synchronous wrapper for extract_tweet
     
@@ -101,13 +118,26 @@ def extract_tweet_sync(username, tweet_id, methods, auth_username=None, auth_pas
         auth_username (str): Username for authentication
         auth_password (str): Password for authentication
         auth_phone (str): Phone number for verification
+        record_video (bool): Whether to record the extraction process
+        record_quality (str): Recording quality ('low', 'medium', 'high')
         
     Returns:
         dict: Tweet content with text and media_urls
     """
-    return asyncio.run(extract_tweet(username, tweet_id, methods, auth_username, auth_password, auth_phone))
+    return asyncio.run(
+        extract_tweet(
+            username, 
+            tweet_id, 
+            methods, 
+            auth_username, 
+            auth_password, 
+            auth_phone,
+            record_video,
+            record_quality
+        )
+    )
 
-async def extract_tweet_combined(username, tweet_id, methods, auth_username=None, auth_password=None, auth_phone=None):
+async def extract_tweet_combined(username, tweet_id, methods, auth_username=None, auth_password=None, auth_phone=None, record_video=False, record_quality='medium'):
     """
     Extract tweet content using all specified methods and combine the results
     
@@ -118,11 +148,15 @@ async def extract_tweet_combined(username, tweet_id, methods, auth_username=None
         auth_username (str): Username for authentication 
         auth_password (str): Password for authentication
         auth_phone (str): Phone number for verification
+        record_video (bool): Whether to record the extraction process
+        record_quality (str): Recording quality ('low', 'medium', 'high')
         
     Returns:
         dict: Combined tweet content with text and media_urls from all sources
     """
     logger.info(f"Starting combined tweet extraction for @{username}/status/{tweet_id}")
+    if record_video:
+        logger.info(f"Screen recording enabled with {record_quality} quality")
     
     # Initialize the combined result
     combined_result = {
@@ -142,12 +176,25 @@ async def extract_tweet_combined(username, tweet_id, methods, auth_username=None
             
             if method == ExtractorType.AUTH_PLAYWRIGHT:
                 from .auth_playwright.extractor import AuthPlaywrightExtractor
-                extractor = AuthPlaywrightExtractor(username, tweet_id, auth_username, auth_password, auth_phone)
+                extractor = AuthPlaywrightExtractor(
+                    username, 
+                    tweet_id, 
+                    auth_username, 
+                    auth_password, 
+                    auth_phone,
+                    record_video=record_video,
+                    record_quality=record_quality
+                )
                 result = await extractor.extract()
                 
             elif method == ExtractorType.PLAYWRIGHT:
                 from .playwright.extractor import PlaywrightExtractor
-                extractor = PlaywrightExtractor(username, tweet_id)
+                extractor = PlaywrightExtractor(
+                    username, 
+                    tweet_id,
+                    record_video=record_video,
+                    record_quality=record_quality
+                )
                 result = await extractor.extract()
                 
             elif method == ExtractorType.METADATA:
@@ -202,12 +249,13 @@ async def extract_tweet_combined(username, tweet_id, methods, auth_username=None
         combined_result['error'] = None
         return combined_result
     else:
-        # If all methods failed, return error result
+        # If all methods failed, return error result - keep text empty, error only in error field
         logger.error("All extraction methods failed")
+        combined_result['text'] = ""  # Ensure no error messages in text field
         combined_result['error'] = "All extraction methods failed"
         return combined_result
 
-def extract_tweet_combined_sync(username, tweet_id, methods, auth_username=None, auth_password=None, auth_phone=None):
+def extract_tweet_combined_sync(username, tweet_id, methods, auth_username=None, auth_password=None, auth_phone=None, record_video=False, record_quality='medium'):
     """
     Synchronous wrapper for extract_tweet_combined
     
@@ -218,8 +266,55 @@ def extract_tweet_combined_sync(username, tweet_id, methods, auth_username=None,
         auth_username (str): Username for authentication
         auth_password (str): Password for authentication
         auth_phone (str): Phone number for verification
+        record_video (bool): Whether to record the extraction process
+        record_quality (str): Recording quality ('low', 'medium', 'high')
         
     Returns:
         dict: Combined tweet content with text and media_urls from all sources
     """
-    return asyncio.run(extract_tweet_combined(username, tweet_id, methods, auth_username, auth_password, auth_phone)) 
+    try:
+        # First try to get the current event loop
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            # If no event loop exists, create a new one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            new_loop_created = True
+        else:
+            new_loop_created = False
+        
+        # Run the extraction task
+        if loop.is_running():
+            # If the loop is already running (we're in an async context)
+            # Create a future and run the extraction in a task
+            future = asyncio.run_coroutine_threadsafe(
+                extract_tweet_combined(username, tweet_id, methods, auth_username, auth_password, auth_phone, record_video, record_quality),
+                loop
+            )
+            result = future.result(timeout=120)  # 2-minute timeout
+        else:
+            # If the loop is not running, use run_until_complete
+            result = loop.run_until_complete(
+                extract_tweet_combined(username, tweet_id, methods, auth_username, auth_password, auth_phone, record_video, record_quality)
+            )
+        
+        # Close the loop if we created it
+        if new_loop_created:
+            loop.close()
+            
+        return result
+    except Exception as e:
+        import logging
+        logger = logging.getLogger('tweet_fetcher')
+        logger.error(f"Error in extract_tweet_combined_sync: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # Return an error result
+        return {
+            'text': "",  # Keep text empty, no error messages in text field
+            'media_urls': [],
+            'source': f"https://twitter.com/{username}/status/{tweet_id}",
+            'error': f"Extraction error: {str(e)}"
+        } 

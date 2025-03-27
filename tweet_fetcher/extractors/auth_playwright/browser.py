@@ -30,6 +30,7 @@ class BrowserSessionManager:
     _storage_size_check_interval = 86400  # 24 hours in seconds - how often to check storage size
     _storage_size_limit = 10 * 1024 * 1024 * 1024  # 10GB in bytes
     _last_storage_size_check = {}  # Maps username to last storage size check time
+    _cleanup_task = None  # Store reference to cleanup task
     
     @classmethod
     async def get_instance(cls):
@@ -38,12 +39,21 @@ class BrowserSessionManager:
             async with cls._lock:
                 if cls._instance is None:
                     cls._instance = cls()
-                    # Start background cleanup task
-                    asyncio.create_task(cls._instance._cleanup_loop())
+                    # Start background cleanup task only if not already running
+                    if cls._cleanup_task is None or cls._cleanup_task.done():
+                        try:
+                            # Get the current event loop rather than creating a new one
+                            loop = asyncio.get_event_loop()
+                            cls._cleanup_task = loop.create_task(cls._instance._cleanup_loop())
+                            # Name the task for better debugging
+                            cls._cleanup_task.set_name("BrowserSessionManager_cleanup")
+                        except RuntimeError:
+                            # If no event loop exists in this thread, log it but don't crash
+                            logger.warning("No event loop available to start cleanup task")
         return cls._instance
     
     @classmethod
-    async def get_browser_session(cls, username=None, password=None, phone_number=None, record_video=False):
+    async def get_browser_session(cls, username=None, password=None, phone_number=None, record_video=False, record_quality='medium'):
         """
         Get an authenticated browser session for a specific user
         
@@ -52,12 +62,13 @@ class BrowserSessionManager:
             password: Twitter/X password
             phone_number: Phone number for verification (with country code)
             record_video: Whether to record video of the login process
+            record_quality: Recording quality ('low', 'medium', 'high')
             
         Returns:
             tuple: (playwright, context, auth_manager)
         """
         manager = await cls.get_instance()
-        return await manager._get_or_create_session(username, password, phone_number, record_video)
+        return await manager._get_or_create_session(username, password, phone_number, record_video, record_quality)
     
     @classmethod
     async def release_session(cls, username=None):
@@ -224,7 +235,20 @@ class BrowserSessionManager:
     @classmethod
     async def close_all_sessions(cls):
         """Close all active browser sessions"""
-        for session_key, (playwright, context, auth_manager, _, _) in cls._active_sessions.items():
+        # First cancel the cleanup task if it's running
+        if cls._cleanup_task and not cls._cleanup_task.done():
+            try:
+                cls._cleanup_task.cancel()
+                # Give it a moment to cancel gracefully
+                try:
+                    await asyncio.wait_for(cls._cleanup_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass  # Expected exceptions during cancellation
+            except Exception as e:
+                logger.error(f"Error cancelling cleanup task: {e}")
+        
+        # Now close all sessions
+        for session_key, (playwright, context, auth_manager, _, _) in list(cls._active_sessions.items()):
             try:
                 # Save storage state before closing
                 await save_storage_state(context, auth_manager)
@@ -236,7 +260,7 @@ class BrowserSessionManager:
         cls._active_sessions = {}
         cls._last_storage_save = {}
     
-    async def _get_or_create_session(self, username=None, password=None, phone_number=None, record_video=False):
+    async def _get_or_create_session(self, username=None, password=None, phone_number=None, record_video=False, record_quality='medium'):
         """Get existing session or create a new one"""
         session_key = username or "default"
         current_time = time.time()
@@ -259,23 +283,61 @@ class BrowserSessionManager:
                 
                 # Create a test page to check if the browser is still responsive
                 try:
-                    test_page = await context.new_page()
-                    await test_page.close()
+                    # Add extra safety to prevent event loop errors
+                    # Store current event loop for reference and comparison
+                    current_loop = asyncio.get_event_loop()
                     
-                    # If it's been a while since our last storage save, do it now
-                    if session_key not in self.__class__._last_storage_save or \
-                       current_time - self.__class__._last_storage_save.get(session_key, 0) > self.__class__._storage_save_interval:
-                        await self.__class__._save_session_storage(session_key)
+                    # Log event loop information for debugging
+                    logger.info(f"Current event loop: {id(current_loop)}, running: {current_loop.is_running()}")
                     
-                    # Attempt to restore any additional storage state
-                    await restore_storage_state(context, auth_manager)
+                    # Try to create a test page with timeout
+                    async with asyncio.timeout(10):  # 10-second timeout for opening a page
+                        test_page = await context.new_page()
                     
-                    return playwright, context, auth_manager
+                    # If page creation worked, check if we can navigate
+                    try:
+                        # Set a short timeout for navigation to detect unresponsive browsers quickly
+                        await test_page.goto("about:blank", timeout=5000)
+                        await test_page.close()
+                        
+                        # If it's been a while since our last storage save, do it now
+                        if session_key not in self.__class__._last_storage_save or \
+                           current_time - self.__class__._last_storage_save.get(session_key, 0) > self.__class__._storage_save_interval:
+                            await self.__class__._save_session_storage(session_key)
+                        
+                        # Attempt to restore any additional storage state
+                        await restore_storage_state(context, auth_manager)
+                        
+                        return playwright, context, auth_manager
+                    except Exception as nav_err:
+                        logger.warning(f"Browser navigation failed during session check: {nav_err}")
+                        await test_page.close()
+                        raise RuntimeError("Browser navigation failed")
                 except Exception as e:
                     logger.warning(f"Existing session is not responsive: {e}. Creating new session.")
+                    error_message = str(e)
+                    
+                    # Detailed logging for specific error types
+                    if "belongs to a different loop" in error_message:
+                        logger.error("Event loop mismatch detected - likely caused by concurrent access")
+                    elif "target closed" in error_message or "context already closed" in error_message:
+                        logger.error("Browser context was closed unexpectedly")
+                    
                     # Session is not responsive, close it and create a new one
                     try:
-                        await playwright.stop()
+                        # Print current event loop for debugging
+                        loop = asyncio.get_event_loop()
+                        logger.info(f"Cleanup loop: {id(loop)}, running: {loop.is_running()}")
+                        
+                        # Track that we're explicitly cleaning up
+                        logger.info(f"Explicitly closing unresponsive playwright session for {session_key}")
+                        
+                        # Use a timeout to avoid hanging
+                        try:
+                            async with asyncio.timeout(5):  # 5-second timeout for closing
+                                await playwright.stop()
+                        except asyncio.TimeoutError:
+                            logger.warning("Timeout while closing playwright - continuing anyway")
                     except Exception as close_err:
                         logger.warning(f"Error closing browser: {close_err}")
             else:
@@ -287,22 +349,48 @@ class BrowserSessionManager:
                 except Exception as close_err:
                     logger.warning(f"Error closing browser: {close_err}")
         
+        # Remove any existing session entry for this user to avoid conflicts
+        if session_key in self.__class__._active_sessions:
+            del self.__class__._active_sessions[session_key]
+        
         # Create a new session with proper error handling
         max_retries = 2
         for retry in range(max_retries):
             try:
-                playwright, context, auth_manager = await create_authenticated_browser(
-                    username, 
-                    password,
-                    phone_number,
-                    record_video=record_video
-                )
-                self.__class__._active_sessions[session_key] = (playwright, context, auth_manager, current_time, True)
-                self.__class__._last_storage_save[session_key] = current_time  # Consider initial creation as a storage save
-                logger.info(f"Created new browser session for {username or 'default user'}")
-                return playwright, context, auth_manager
+                # Use a try-finally to ensure we clean up on failure
+                try:
+                    playwright, context, auth_manager = await create_authenticated_browser(
+                        username, 
+                        password,
+                        phone_number,
+                        record_video=record_video,
+                        record_quality=record_quality
+                    )
+                    
+                    # Register the new session
+                    self.__class__._active_sessions[session_key] = (playwright, context, auth_manager, current_time, True)
+                    self.__class__._last_storage_save[session_key] = current_time  # Consider initial creation as a storage save
+                    logger.info(f"Created new browser session for {username or 'default user'}")
+                    
+                    # Final validation - ensure the session is usable by creating a test page
+                    test_page = await context.new_page()
+                    await test_page.goto("about:blank", timeout=5000)
+                    await test_page.close()
+                    
+                    return playwright, context, auth_manager
+                except Exception as e:
+                    # If we got a playwright and context but then had an error, clean them up
+                    if 'playwright' in locals() and playwright is not None:
+                        try:
+                            await playwright.stop()
+                        except Exception as stop_err:
+                            logger.warning(f"Error stopping playwright during error handling: {stop_err}")
+                    raise e  # Re-raise to be caught by the outer exception handler
             except Exception as e:
                 logger.error(f"Failed to create browser session (attempt {retry+1}/{max_retries}): {e}")
+                # Sleep briefly before retrying
+                await asyncio.sleep(1)
+                
                 if retry == max_retries - 1:
                     # Last retry failed, falling back to non-authenticated approach
                     logger.error("All attempts to create browser session failed")
@@ -322,18 +410,19 @@ class BrowserSessionManager:
         # This should never be reached due to the raise above
         raise RuntimeError("Failed to create browser session")
     
-    async def _cleanup_expired_sessions(self):
+    @classmethod
+    async def _cleanup_expired_sessions(cls):
         """Clean up expired browser sessions"""
         current_time = time.time()
         expired_users = []
         
-        for session_key, (playwright, context, auth_manager, last_used, in_use) in self.__class__._active_sessions.items():
+        for session_key, (playwright, context, auth_manager, last_used, in_use) in cls._active_sessions.items():
             # Don't close sessions that are in use
             if in_use:
                 continue
                 
             # Close sessions that haven't been used for a while
-            if current_time - last_used > self.__class__._session_timeout:
+            if current_time - last_used > cls._session_timeout:
                 try:
                     # Save storage state before closing
                     await save_storage_state(context, auth_manager)
@@ -346,21 +435,67 @@ class BrowserSessionManager:
         
         # Remove expired sessions from tracking
         for session_key in expired_users:
-            del self.__class__._active_sessions[session_key]
-            if session_key in self.__class__._last_storage_save:
-                del self.__class__._last_storage_save[session_key]
+            del cls._active_sessions[session_key]
+            if session_key in cls._last_storage_save:
+                del cls._last_storage_save[session_key]
+    
+    @classmethod
+    async def _keep_sessions_alive(cls):
+        """Refresh sessions to prevent them from expiring"""
+        for session_key, (playwright, context, auth_manager, last_used, in_use) in cls._active_sessions.items():
+            # Skip sessions that are currently in use
+            if in_use:
+                continue
+                
+            try:
+                # Check if the session needs refreshing
+                current_time = time.time()
+                # Refresh session if it's been inactive for more than 15 minutes but less than timeout
+                if current_time - last_used > 900 and current_time - last_used < cls._session_timeout:
+                    logger.info(f"Refreshing browser session for {session_key}")
+                    
+                    # Create a test page and visit Twitter to keep the session active
+                    test_page = await context.new_page()
+                    await test_page.goto("https://x.com/home", timeout=30000, wait_until="domcontentloaded")
+                    
+                    # Scroll a bit to simulate activity
+                    await test_page.evaluate("""
+                        window.scrollBy(0, 300);
+                        setTimeout(() => { window.scrollBy(0, 200); }, 500);
+                    """)
+                    
+                    # Wait a bit for any background processes to complete
+                    await asyncio.sleep(2)
+                    
+                    # Close the page
+                    await test_page.close()
+                    
+                    # Update the last used time
+                    cls._active_sessions[session_key] = (playwright, context, auth_manager, current_time, False)
+                    logger.info(f"Successfully refreshed session for {session_key}")
+                    
+                    # Save storage state after refreshing
+                    await cls._save_session_storage(session_key)
+            except Exception as e:
+                logger.error(f"Error refreshing session for {session_key}: {e}")
     
     async def _cleanup_loop(self):
-        """Background task to periodically clean up expired sessions"""
+        """Background task to periodically clean up expired sessions and keep active sessions alive"""
         while True:
             try:
-                await asyncio.sleep(self.__class__._cleanup_interval)
+                # First keep active sessions alive
+                await self.__class__._keep_sessions_alive()
+                
+                # Then clean up any expired sessions
                 await self._cleanup_expired_sessions()
+                
+                # Sleep until next check
+                await asyncio.sleep(self.__class__._cleanup_interval)
             except Exception as e:
                 logger.error(f"Error in session cleanup loop: {e}")
                 # Continue running even if there's an error
 
-async def create_authenticated_browser(username=None, password=None, phone_number=None, record_video=False):
+async def create_authenticated_browser(username=None, password=None, phone_number=None, record_video=False, record_quality='medium'):
     """
     Create an authenticated browser session for Twitter/X with advanced anti-detection
     
@@ -369,6 +504,7 @@ async def create_authenticated_browser(username=None, password=None, phone_numbe
         password: Twitter password
         phone_number: Phone number for verification (with country code)
         record_video: Whether to record video of the login process
+        record_quality: Recording quality ('low', 'medium', 'high')
         
     Returns:
         tuple: (playwright instance, browser_context, auth_manager)
@@ -420,13 +556,23 @@ async def create_authenticated_browser(username=None, password=None, phone_numbe
             safe_user_id = ''.join(c if c.isalnum() else '_' for c in user_id)
             video_path = os.path.join(VIDEO_DIR, f"login_{safe_user_id}_{timestamp}.webm")
             
+            # Map quality settings to resolutions
+            quality_to_resolution = {
+                'low': {'width': 854, 'height': 480},
+                'medium': {'width': 1280, 'height': 720},
+                'high': {'width': 1920, 'height': 1080}
+            }
+            
+            # Get recording size based on quality
+            video_size = quality_to_resolution.get(record_quality, quality_to_resolution['medium'])
+            
             # Configure recording options - make compatible with older Playwright versions
             # In older versions, record_video_dir is used instead of record_video.dir
             recording_options = {
                 "record_video_dir": os.path.dirname(video_path),
-                "record_video_size": {"width": viewport["width"], "height": viewport["height"]}
+                "record_video_size": video_size
             }
-            logger.info(f"Recording login process to: {video_path}")
+            logger.info(f"Recording login process to: {video_path} with {record_quality} quality ({video_size['width']}x{video_size['height']})")
         
         # Launch browser with full capabilities - essential for X's anti-bot measures
         context = await browser_type.launch_persistent_context(
@@ -523,10 +669,55 @@ async def create_authenticated_browser(username=None, password=None, phone_numbe
             # Only try to authenticate if not already authenticated
             if not is_auth:
                 logger.info("Attempting to authenticate with username and password")
-                auth_success = await auth_manager.authenticate(page)
                 
-                if auth_success:
-                    # Explicitly save storage state to ensure it's persisted
+                # Go to Twitter/X login page to ensure we start from a clean state
+                await page.goto("https://x.com/login", timeout=30000, wait_until="domcontentloaded")
+                
+                # Check again - sometimes navigating to login redirects to home if already logged in
+                is_auth = await auth_manager.is_authenticated(page)
+                
+                if not is_auth:
+                    # Try authentication with up to 3 attempts
+                    auth_success = False
+                    max_retries = 3
+                    
+                    for attempt in range(max_retries):
+                        logger.info(f"Authentication attempt {attempt+1}/{max_retries}")
+                        try:
+                            auth_success = await auth_manager.authenticate(page)
+                            
+                            if auth_success:
+                                logger.info(f"Authentication successful on attempt {attempt+1}")
+                                break
+                            else:
+                                # If authentication failed but no error was thrown
+                                logger.warning(f"Authentication attempt {attempt+1} failed without error")
+                                # Clear any cookies and retry
+                                await context.clear_cookies()
+                                await page.goto("https://x.com/login", timeout=30000, wait_until="domcontentloaded")
+                        except Exception as auth_err:
+                            logger.error(f"Authentication error on attempt {attempt+1}: {auth_err}")
+                            if attempt < max_retries - 1:
+                                logger.info("Retrying authentication after error...")
+                                # Clear any cookies and retry
+                                await context.clear_cookies()
+                                await page.goto("https://x.com/login", timeout=30000, wait_until="domcontentloaded")
+                    
+                    # After authentication attempts, verify if we're actually logged in
+                    await page.goto("https://x.com/home", timeout=30000, wait_until="domcontentloaded")
+                    final_auth_check = await auth_manager.is_authenticated(page)
+                    
+                    if final_auth_check:
+                        logger.info("Successfully authenticated and verified")
+                        # Explicitly save storage state to ensure it's persisted
+                        await save_storage_state(context, auth_manager)
+                    else:
+                        logger.warning("Authentication process completed but verification failed")
+                        # Take a screenshot for debugging
+                        screenshot_path = os.path.join(SCREENSHOTS_DIR, "login", f"failed_auth_{int(time.time())}.png")
+                        await page.screenshot(path=screenshot_path)
+                else:
+                    logger.info("Already authenticated after navigating to login page (redirected to home)")
                     await save_storage_state(context, auth_manager)
             else:
                 logger.info("Using existing authenticated session")
@@ -537,6 +728,13 @@ async def create_authenticated_browser(username=None, password=None, phone_numbe
             # Take a screenshot of the final state after authentication
             screenshot_path = os.path.join(SCREENSHOTS_DIR, "login", f"final_state_{int(time.time())}.png")
             await page.screenshot(path=screenshot_path)
+            
+            # One last check to verify authentication status
+            final_status = await auth_manager.is_authenticated(page)
+            if final_status:
+                logger.info("Final verification confirms authenticated status")
+            else:
+                logger.warning("Final verification shows not authenticated - session may not work properly")
             
             # Close the page used for login
             await page.close()

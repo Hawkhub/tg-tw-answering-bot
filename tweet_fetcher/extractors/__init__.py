@@ -273,37 +273,38 @@ def extract_tweet_combined_sync(username, tweet_id, methods, auth_username=None,
         dict: Combined tweet content with text and media_urls from all sources
     """
     try:
-        # First try to get the current event loop
+        # Create a completely separate event loop for this extraction to avoid conflicts
+        loop = asyncio.new_event_loop()
         try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            # If no event loop exists, create a new one
-            loop = asyncio.new_event_loop()
+            # Set as the current event loop for this thread
             asyncio.set_event_loop(loop)
-            new_loop_created = True
-        else:
-            new_loop_created = False
-        
-        # Run the extraction task
-        if loop.is_running():
-            # If the loop is already running (we're in an async context)
-            # Create a future and run the extraction in a task
-            future = asyncio.run_coroutine_threadsafe(
-                extract_tweet_combined(username, tweet_id, methods, auth_username, auth_password, auth_phone, record_video, record_quality),
-                loop
-            )
-            result = future.result(timeout=120)  # 2-minute timeout
-        else:
-            # If the loop is not running, use run_until_complete
+            
+            # Run the extraction task in this isolated loop
             result = loop.run_until_complete(
                 extract_tweet_combined(username, tweet_id, methods, auth_username, auth_password, auth_phone, record_video, record_quality)
             )
-        
-        # Close the loop if we created it
-        if new_loop_created:
-            loop.close()
             
-        return result
+            return result
+        finally:
+            # Always clean up and close the loop, even if there was an error
+            try:
+                # Get all pending tasks in this loop
+                pending = asyncio.all_tasks(loop)
+                if pending:
+                    # Cancel all tasks and give them a chance to clean up
+                    for task in pending:
+                        task.cancel()
+                    # Wait with a timeout for tasks to acknowledge cancellation
+                    done, pending = loop.run_until_complete(
+                        asyncio.wait(pending, timeout=5, return_when=asyncio.ALL_COMPLETED)
+                    )
+            except Exception as cleanup_err:
+                import logging
+                logger = logging.getLogger('tweet_fetcher')
+                logger.warning(f"Error cleaning up tasks during extraction: {cleanup_err}")
+            finally:
+                # Close the loop
+                loop.close()
     except Exception as e:
         import logging
         logger = logging.getLogger('tweet_fetcher')

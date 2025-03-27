@@ -154,8 +154,8 @@ def handle_twitter_link(bot, message):
         # Send tweet content and media to user in a consolidated message
         content_msg = ""
         if tweet_content.get('text'):
-            content_msg += f"{tweet_content['text']}\n\n"
-        content_msg += f"Source: {tweet_content['source']}"
+            content_msg += f"\"{tweet_content['text']}\"\n\n"
+        content_msg += f"{tweet_content['source']}"
         
         # Check if we have media
         if tweet_content.get('media_urls'):

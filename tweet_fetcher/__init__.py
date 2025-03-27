@@ -37,59 +37,47 @@ def download_media(url, output_path):
         # Ensure directory exists
         os.makedirs(output_dir, exist_ok=True)
         
-        # Try to get existing event loop or create a new one
+        # Create a completely separate event loop for this download to avoid conflicts
+        loop = asyncio.new_event_loop()
         try:
-            loop = asyncio.get_event_loop()
-            new_loop_created = False
-        except RuntimeError:
-            # No event loop in this thread, create a new one
-            loop = asyncio.new_event_loop()
+            # Set as the current event loop for this thread
             asyncio.set_event_loop(loop)
-            new_loop_created = True
-        
-        # Run the async function
-        if loop.is_running():
-            # If the loop is already running (we're in an async context)
-            # Create a future and run the download in a task
-            future = asyncio.run_coroutine_threadsafe(
-                async_download_media(url, output_dir),
-                loop
-            )
-            result = future.result(timeout=60)  # 1-minute timeout
-        else:
-            # If the loop is not running, use run_until_complete
+            
+            # Run the async function in this isolated loop
             result = loop.run_until_complete(async_download_media(url, output_dir))
-        
-        # Close the loop only if we created it
-        if new_loop_created:
+            
+            # If the download was successful, rename the file to the expected output_path
+            if result:
+                # Rename only if the result path is different from the expected path
+                if result != output_path and os.path.exists(result):
+                    # If target file already exists, remove it
+                    if os.path.exists(output_path):
+                        os.unlink(output_path)
+                        
+                    # Rename/move the file
+                    os.rename(result, output_path)
+                    logger.info(f"Renamed {result} to {output_path}")
+                    return output_path
+                return result
+            return None
+        finally:
+            # Always clean up and close the loop, even if there was an error
             try:
-                # Run any pending tasks before closing
-                pending = [task for task in asyncio.all_tasks(loop)
-                           if not task.done() and task != asyncio.current_task(loop)]
-                
+                # Get all pending tasks in this loop
+                pending = asyncio.all_tasks(loop)
                 if pending:
-                    logger.info(f"Waiting for {len(pending)} pending tasks to complete...")
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            except Exception as e:
-                logger.warning(f"Error during cleanup of pending tasks: {e}")
-                
-            # Now close the loop
-            loop.close()
-        
-        # If the download was successful, rename the file to the expected output_path
-        if result:
-            # Rename only if the result path is different from the expected path
-            if result != output_path and os.path.exists(result):
-                # If target file already exists, remove it
-                if os.path.exists(output_path):
-                    os.unlink(output_path)
-                    
-                # Rename/move the file
-                os.rename(result, output_path)
-                logger.info(f"Renamed {result} to {output_path}")
-                return output_path
-            return result
-        return None
+                    # Cancel all tasks and give them a chance to clean up
+                    for task in pending:
+                        task.cancel()
+                    # Wait with a timeout for tasks to acknowledge cancellation
+                    done, pending = loop.run_until_complete(
+                        asyncio.wait(pending, timeout=5, return_when=asyncio.ALL_COMPLETED)
+                    )
+            except Exception as cleanup_err:
+                logger.warning(f"Error cleaning up tasks during download: {cleanup_err}")
+            finally:
+                # Close the loop
+                loop.close()
     except Exception as e:
         logger.error(f"Error in synchronous download_media: {e}")
         import traceback
@@ -117,40 +105,41 @@ def shutdown():
     
     # Run the async shutdown in an event loop
     try:
-        # First try to get the current event loop
+        # Create a completely new event loop for shutdown to avoid conflicts
+        shutdown_loop = asyncio.new_event_loop()
         try:
-            loop = asyncio.get_event_loop()
-            new_loop_created = False
-        except RuntimeError:
-            # No event loop in this thread, create a new one
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            new_loop_created = True
-        
-        # Run the browser shutdown task
-        if loop.is_running():
-            # If we're in an async context already, use run_coroutine_threadsafe
-            future = asyncio.run_coroutine_threadsafe(_shutdown_browser_sessions(), loop)
-            # Wait for the future to complete with a timeout
-            future.result(timeout=30)  # 30-second timeout
-        else:
-            # If we're not in an async context, use run_until_complete
-            loop.run_until_complete(_shutdown_browser_sessions())
-        
-        # Close the loop only if we created it
-        if new_loop_created:
-            try:
-                # Run any pending tasks before closing
-                pending = [task for task in asyncio.all_tasks(loop)
-                           if not task.done() and task != asyncio.current_task(loop)]
-                if pending:
-                    logger.info(f"Waiting for {len(pending)} pending tasks to complete...")
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            except Exception as e:
-                logger.warning(f"Error during cleanup of pending tasks: {e}")
+            # Set as the current event loop for this thread
+            asyncio.set_event_loop(shutdown_loop)
             
-            # Now close the loop
-            loop.close()
+            # Run the browser shutdown task
+            shutdown_loop.run_until_complete(_shutdown_browser_sessions())
+            logger.info("Browser sessions shutdown completed")
+            
+            # Get any pending tasks
+            pending = asyncio.all_tasks(shutdown_loop)
+            if pending:
+                logger.info(f"Waiting for {len(pending)} pending tasks to complete...")
+                
+                # Use wait with timeout to avoid hanging
+                done, pending = shutdown_loop.run_until_complete(
+                    asyncio.wait(pending, timeout=5, return_when=asyncio.ALL_COMPLETED)
+                )
+                
+                # Cancel any tasks that didn't finish
+                if pending:
+                    logger.warning(f"Forcibly cancelling {len(pending)} tasks that didn't complete")
+                    for task in pending:
+                        task.cancel()
+                    
+                    # Give a short grace period for cancellation to be processed
+                    try:
+                        shutdown_loop.run_until_complete(asyncio.wait(pending, timeout=1))
+                    except Exception as e:
+                        logger.warning(f"Error during final task cancellation: {e}")
+            
+        finally:
+            # Always close the loop
+            shutdown_loop.close()
             
         logger.info("Tweet fetcher shutdown completed successfully")
     except Exception as e:

@@ -31,6 +31,28 @@ class BrowserSessionManager:
     _storage_size_limit = 10 * 1024 * 1024 * 1024  # 10GB in bytes
     _last_storage_size_check = {}  # Maps username to last storage size check time
     _cleanup_task = None  # Store reference to cleanup task
+    _managed_tasks = {}  # Track all tasks created by this manager
+    
+    @classmethod
+    def _track_task(cls, task, task_type="unknown"):
+        """Track a task created by this manager"""
+        task_id = id(task)
+        cls._managed_tasks[task_id] = {
+            "task": task,
+            "type": task_type,
+            "created_at": time.time(),
+            "stack": traceback.format_stack()
+        }
+        logger.debug(f"Tracking new task {task_id} of type {task_type}")
+        
+        # Add a callback to remove the task when it's done
+        def _cleanup_task_tracking(t):
+            if id(t) in cls._managed_tasks:
+                del cls._managed_tasks[id(t)]
+                logger.debug(f"Task {id(t)} completed and removed from tracking")
+        
+        task.add_done_callback(_cleanup_task_tracking)
+        return task
     
     @classmethod
     async def get_instance(cls):
@@ -44,14 +66,143 @@ class BrowserSessionManager:
                         try:
                             # Get the current event loop rather than creating a new one
                             loop = asyncio.get_event_loop()
-                            cls._cleanup_task = loop.create_task(cls._instance._cleanup_loop())
-                            # Name the task for better debugging
-                            cls._cleanup_task.set_name("BrowserSessionManager_cleanup")
+                            
+                            # Don't create a background task if using telebot's loop
+                            # This prevents hanging tasks during bot initialization
+                            import inspect
+                            caller_frames = inspect.stack()
+                            caller_modules = [frame.f_globals['__name__'] for frame in caller_frames]
+                            caller_filenames = [frame.filename for frame in caller_frames]
+                            
+                            # Check if we're being called from telebot or bot.py
+                            is_bot_context = any('telebot' in m for m in caller_modules) or \
+                                            any('bot.py' in f for f in caller_filenames)
+                            
+                            # Do not create background tasks in telebot context
+                            if is_bot_context:
+                                logger.info("Skipping background cleanup task creation from bot/telebot context")
+                            else:
+                                # Only create background task from non-telebot contexts
+                                cleanup_task = loop.create_task(cls._instance._cleanup_loop())
+                                # Name the task for better debugging
+                                cleanup_task.set_name("BrowserSessionManager_cleanup")
+                                # Track the task
+                                cls._cleanup_task = cls._track_task(cleanup_task, "cleanup_loop")
+                                logger.info("Created browser session cleanup background task")
                         except RuntimeError:
                             # If no event loop exists in this thread, log it but don't crash
                             logger.warning("No event loop available to start cleanup task")
         return cls._instance
     
+    @classmethod
+    async def list_managed_tasks(cls):
+        """List all tasks currently being managed by the BrowserSessionManager"""
+        current_time = time.time()
+        task_info = []
+        
+        for task_id, task_data in cls._managed_tasks.items():
+            task = task_data["task"]
+            age = current_time - task_data["created_at"]
+            
+            task_info.append({
+                "id": task_id,
+                "type": task_data["type"],
+                "name": task.get_name() if hasattr(task, 'get_name') else "Unknown",
+                "age_seconds": age,
+                "done": task.done(),
+                "cancelled": task.cancelled() if hasattr(task, 'cancelled') else False,
+                "stack": task_data.get("stack", "Unknown creation location")
+            })
+            
+        return task_info
+    
+    @classmethod
+    async def cancel_all_managed_tasks(cls):
+        """Cancel all tasks being managed by BrowserSessionManager"""
+        tasks_to_cancel = list(cls._managed_tasks.values())
+        cancelled_count = 0
+        
+        for task_data in tasks_to_cancel:
+            task = task_data["task"]
+            task_type = task_data["type"]
+            
+            if not task.done():
+                logger.info(f"Cancelling managed task of type {task_type}")
+                task.cancel()
+                cancelled_count += 1
+        
+        # Wait for tasks to acknowledge cancellation 
+        if cancelled_count > 0:
+            pending_tasks = [data["task"] for data in tasks_to_cancel if not data["task"].done()]
+            if pending_tasks:
+                try:
+                    # Wait with timeout to avoid hanging
+                    await asyncio.wait(pending_tasks, timeout=5)
+                except Exception as e:
+                    logger.warning(f"Error waiting for tasks to cancel: {e}")
+                    
+        return cancelled_count
+    
+    @classmethod
+    async def clear_pending_tasks(cls, loop=None):
+        """
+        Cancel and clear all pending tasks on the specified event loop
+        
+        Args:
+            loop: The event loop to clear tasks from (default: current loop)
+        """
+        try:
+            # First cancel all tasks managed by us
+            await cls.cancel_all_managed_tasks()
+            
+            # Get the loop if not provided
+            if loop is None:
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    logger.warning("No event loop to clear tasks from")
+                    return False
+            
+            # Get all pending tasks except the current one
+            current_task = asyncio.current_task(loop)
+            pending_tasks = [task for task in asyncio.all_tasks(loop) 
+                            if not task.done() and task != current_task]
+            
+            if not pending_tasks:
+                logger.info("No pending tasks to clear")
+                return True
+                
+            logger.info(f"Cancelling {len(pending_tasks)} pending tasks")
+            
+            # Cancel all pending tasks
+            for task in pending_tasks:
+                task_name = task.get_name() if hasattr(task, 'get_name') else str(task)
+                logger.info(f"Cancelling task: {task_name}")
+                task.cancel()
+            
+            # Wait for all tasks to be cancelled with a timeout
+            try:
+                # Use wait_for to avoid hanging indefinitely
+                await asyncio.wait_for(
+                    asyncio.gather(*pending_tasks, return_exceptions=True),
+                    timeout=10  # 10-second timeout
+                )
+                logger.info("All pending tasks have been cancelled")
+                return True
+            except asyncio.TimeoutError:
+                logger.warning("Timeout while waiting for tasks to cancel")
+                # Check which tasks are still pending
+                still_pending = [task for task in pending_tasks if not task.done()]
+                if still_pending:
+                    logger.warning(f"{len(still_pending)} tasks are still pending despite cancellation")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error clearing pending tasks: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+            
     @classmethod
     async def get_browser_session(cls, username=None, password=None, phone_number=None, record_video=False, record_quality='medium'):
         """
@@ -67,6 +218,16 @@ class BrowserSessionManager:
         Returns:
             tuple: (playwright, context, auth_manager)
         """
+        # Don't use background cleanup when getting a browser session
+        # This prevents hanging tasks during bot initialization
+        if cls._cleanup_task and not cls._cleanup_task.done():
+            logger.info("Cancelling existing cleanup task before getting browser session")
+            cls._cleanup_task.cancel()
+            try:
+                await asyncio.wait_for(cls._cleanup_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            
         manager = await cls.get_instance()
         return await manager._get_or_create_session(username, password, phone_number, record_video, record_quality)
     
@@ -481,19 +642,49 @@ class BrowserSessionManager:
     
     async def _cleanup_loop(self):
         """Background task to periodically clean up expired sessions and keep active sessions alive"""
-        while True:
-            try:
-                # First keep active sessions alive
-                await self.__class__._keep_sessions_alive()
-                
-                # Then clean up any expired sessions
-                await self._cleanup_expired_sessions()
-                
-                # Sleep until next check
-                await asyncio.sleep(self.__class__._cleanup_interval)
-            except Exception as e:
-                logger.error(f"Error in session cleanup loop: {e}")
-                # Continue running even if there's an error
+        logger.info("Starting browser session cleanup loop")
+        
+        try:
+            # Use a timeout to ensure we don't run too long on any given cleanup
+            async with asyncio.timeout(self.__class__._cleanup_interval):
+                while True:
+                    try:
+                        # First keep active sessions alive
+                        await self.__class__._keep_sessions_alive()
+                        
+                        # Then clean up any expired sessions
+                        await self._cleanup_expired_sessions()
+                        
+                        # Sleep until next check (with shorter intervals to check for cancellation)
+                        # Break the sleep into smaller chunks so we can respond to cancellation quicker
+                        sleep_interval = 5 * 60  # 5 minutes
+                        total_sleep = 0
+                        
+                        while total_sleep < self.__class__._cleanup_interval:
+                            # Check if the task is being cancelled
+                            await asyncio.sleep(sleep_interval)
+                            total_sleep += sleep_interval
+                            
+                            # Check if the task is cancelled
+                            if asyncio.current_task().cancel_requested:
+                                logger.info("Cleanup loop cancellation requested, exiting")
+                                return
+                                
+                    except asyncio.CancelledError:
+                        logger.info("Browser session cleanup loop was cancelled")
+                        return
+                    except Exception as e:
+                        logger.error(f"Error in session cleanup loop: {e}")
+                        # Continue running even if there's an error
+                        await asyncio.sleep(60)  # Wait a bit before retrying
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            logger.info("Browser session cleanup loop timed out or was cancelled")
+        except Exception as e:
+            logger.error(f"Fatal error in browser session cleanup loop: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        finally:
+            logger.info("Browser session cleanup loop exited")
 
 async def create_authenticated_browser(username=None, password=None, phone_number=None, record_video=False, record_quality='medium'):
     """
